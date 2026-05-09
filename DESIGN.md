@@ -452,7 +452,26 @@ CREATE TABLE inbox_clusters (id, name, description, count, ...);
 
 `poi_card` 是检索召回率最高的 chunk，是查询命中的主力。
 
+### 5.4 当前实现：从收藏到入库的完整链路
+
+设计上的「ingest 流水线」对应代码里的两个文件：
+
+- [`backend/app/services/inbox_promote.py`](backend/app/services/inbox_promote.py) — `promote_notes()` 是入口。从 inbox 取出选定的 `note_id`，对每条：
+  1. 状态置 `processing`；
+  2. 调 `XhsDetailCrawler` 或 `fetch_note_detail_http`（cookie-less SSR 路线，见 [docs/crawler.md](docs/crawler.md)）抓正文 + 图片 + 标签；
+  3. 喂给 `ingest_note`；
+  4. 状态置 `promoted`，失败置 `failed` 并把短错误存进 `last_error`。
+
+- [`backend/app/services/ingest.py`](backend/app/services/ingest.py) — `ingest_note(store, raw)` 把单条原始数据落库：
+  1. LLM 抽取 `primary_city` / `primary_country` / `purposes` / `summary` / `pois`（兜底：扫文本里的城市别名）；
+  2. 构建 chunks：`title` + `body`（按段切）+ 每个 POI 一个 `poi_card`（**当前还没接图片 OCR / VLM 描述 chunk**，§5.1/5.3 里的 `image_desc` 和 `ocr` 仍是 TODO）；
+  3. 用 e5 embed 所有 chunks；
+  4. `store.upsert_note(...)` 一次写入 `notes` + `note_chunks` + `pois` + `note_poi`。
+
+整批 promote **同步执行**（无后台队列），用 `max_per_request` 上限挡 HTTP 超时，UI 端切片提交。
+
 ---
+
 
 ## 6. 鲜活度验证策略
 
@@ -623,23 +642,24 @@ CREATE TABLE inbox_clusters (id, name, description, count, ...);
 
 ### Phase 1 · 自部署 MVP（1–2 周，CLI）
 
-- [ ] MediaCrawler 跑通"我的收藏"导出
-- [ ] **`KnowledgeStore` 接口**（这一步决定后面能不能一套代码两形态）：定义 ingest / search / mark_freshness 等抽象方法
-- [ ] SQLite 实现该接口
-- [ ] 接 Qwen JSON 抽取（含 city 自动分类）+ PaddleOCR
-- [ ] BGE-M3 (本地 sentence-transformers)
-- [ ] sqlite-vec + FTS5 混合检索
-- [ ] CLI: `xhskb search "京都拉面"` / `xhskb refresh-city 东京`
+- [x] MediaCrawler 跑通"我的收藏"导出（自研 Playwright/CDP 实现，见 [docs/crawler.md](docs/crawler.md)）
+- [x] **`KnowledgeStore` 接口**（这一步决定后面能不能一套代码两形态）：定义 ingest / search / mark_freshness 等抽象方法
+- [x] SQLite 实现该接口
+- [x] 接 LLM JSON 抽取（含 city 自动分类）— 当前用 Azure OpenAI / Qwen / Mock 三档可切换；PaddleOCR 暂未接入
+- [x] 本地 embedding：multilingual-e5-base on MPS（替代 BGE-M3，见 [docs/embedding.md](docs/embedding.md)）
+- [x] sqlite-vec + FTS5 混合检索
+- [ ] CLI: `xhskb search "京都拉面"` / `xhskb refresh-city 东京`（搜索能力已在 backend 内实现，但还没包成 CLI 命令）
 
 **交付物**：开源仓库，能在 Mac/Linux 上 `pipx install` 后直接用。
 
 ### Phase 2 · 自部署 Web UI + 手机访问（2 周）
 
-- [ ] FastAPI 后端 + Next.js 前端（PWA 化，可加到主屏）
-- [ ] 目的地工作台 + 城市卡片首页
-- [ ] 单帖详情 + 图片画廊
+- [x] FastAPI 后端 + Next.js 前端（PWA 化待办）
+- [x] 目的地工作台 + 城市卡片首页
+- [x] 单帖详情 + 图片画廊
+- [x] 我的收藏 inbox + 多标签自动聚类（见 [docs/clustering.md](docs/clustering.md)）
 - [ ] 高德 POI 解析 + 鲜活度按需验证（按城市批量）
-- [ ] 增量同步定时任务（cron）
+- [ ] 增量同步定时任务（cron）— 目前是 UI 上点「扫描收藏夹」手动触发
 - [ ] **Tailscale Funnel 一键集成**：用户跑 `xhskb expose` 自动起隧道，手机扫二维码加书签
 - [ ] L1/L2 分级处理 UI
 
