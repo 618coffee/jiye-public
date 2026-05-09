@@ -25,6 +25,24 @@ class LLMProvider(ABC):
         Cluster = {label:str, reason:str, note_ids:[str]}
         """
 
+    @abstractmethod
+    def cluster_titles(
+        self,
+        titles: list[str],
+        *,
+        target_clusters: int = 12,
+    ) -> list[dict[str, Any]]:
+        """Group a free-form list of note titles into ~target_clusters thematic
+        buckets. Used by the inbox-filtering UI so the user can decide which
+        category to spend processing budget on.
+
+        Returns: list of {id, name, description, sample_titles}
+          - id: short slug ('food-jp', 'cafe-sh', ...)
+          - name: human-friendly Chinese label (8-12 字)
+          - description: one-line explanation (≤30 字)
+          - sample_titles: 2-4 representative titles drawn from the input
+        """
+
 
 _CITY_HINTS = {
     "京都": ("京都", "JP"), "Kyoto": ("京都", "JP"),
@@ -145,6 +163,45 @@ class MockLLMProvider(LLMProvider):
             })
         return {"hot": hot, "cold": cold, "dish_radar": dish, "blind_spots": blind}
 
+    def cluster_titles(self, titles: list[str], *, target_clusters: int = 12) -> list[dict[str, Any]]:
+        """Heuristic mock: bucket by purpose/city hints, then 'Other'."""
+        from collections import defaultdict
+        # bucket key -> (label, list of titles)
+        buckets: dict[str, list[str]] = defaultdict(list)
+
+        def _classify(t: str) -> str:
+            city_hit = next((c for c, _ in _CITY_HINTS.values() if c in t), None)
+            purpose_hit = next((v for k, v in _PURPOSE_HINTS.items() if k in t), None)
+            if city_hit and purpose_hit:
+                return f"{city_hit}-{purpose_hit}"
+            if city_hit:
+                return f"{city_hit}-other"
+            if purpose_hit:
+                return f"any-{purpose_hit}"
+            return "other-other"
+
+        for t in titles:
+            buckets[_classify(t)].append(t)
+
+        purpose_zh = {
+            "food": "美食", "cafe": "咖啡", "scenic": "景点",
+            "shopping": "购物", "photo": "拍照", "stay": "住宿", "other": "其他",
+        }
+        out: list[dict[str, Any]] = []
+        for key, items in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
+            city, purpose = key.split("-", 1)
+            name = (
+                f"{city}{purpose_zh.get(purpose, purpose)}" if city != "any" and city != "other"
+                else (purpose_zh.get(purpose, purpose) or "其他")
+            )
+            out.append({
+                "id": key,
+                "name": name,
+                "description": f"包含 {len(items)} 条相关收藏",
+                "sample_titles": items[:3],
+            })
+        return out[:target_clusters]
+
 
 class QwenLLMProvider(LLMProvider):
     def __init__(self, api_key: str):
@@ -181,6 +238,9 @@ class QwenLLMProvider(LLMProvider):
 
     def cluster_city(self, city: str, notes: list[dict[str, Any]]) -> dict[str, Any]:
         return MockLLMProvider().cluster_city(city, notes)
+
+    def cluster_titles(self, titles: list[str], *, target_clusters: int = 12) -> list[dict[str, Any]]:
+        return MockLLMProvider().cluster_titles(titles, target_clusters=target_clusters)
 
 
 _EXTRACT_PROMPT = (
@@ -350,6 +410,87 @@ class AzureOpenAILLMProvider(LLMProvider):
             return out
         except Exception:
             return MockLLMProvider().cluster_city(city, notes)
+
+    def cluster_titles(self, titles: list[str], *, target_clusters: int = 12) -> list[dict[str, Any]]:
+        if not titles:
+            return []
+        # Truncate each title to 60 chars and cap total count to be safe with
+        # context windows; the caller is expected to sample if it has more.
+        sample = [t[:60] for t in titles[:300]]
+        numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(sample))
+        prompt = (
+            f"以下是用户从小红书收藏的笔记标题（共 {len(sample)} 条）：\n"
+            f"{numbered}\n\n"
+            f"请把它们按主题/地点/类型聚成 {target_clusters} 个中文簇，输出严格 JSON 数组：\n"
+            "[\n"
+            '  {\n'
+            '    "id": "短英文 slug，如 food-jp / cafe-sh / fitness / fashion-outfit",\n'
+            '    "name": "中文标签（6-12 字，例如「京都美食」「上海咖啡」「健身打卡」）",\n'
+            '    "description": "一句话说明这个簇收什么样的帖子（≤30 字）",\n'
+            '    "sample_titles": ["挑 2-4 条最有代表性的原标题"]\n'
+            '  },\n'
+            "  ...\n"
+            "]\n"
+            "注意：\n"
+            f"1) 簇数控制在 {max(target_clusters - 4, 6)}-{target_clusters + 4} 之间，太多就合并；\n"
+            "2) sample_titles 必须是上面列表里出现过的原文；\n"
+            "3) 每条标题尽量只归到一个簇，但允许 ≤10% 标题不属于任何明显簇——把它们归到 id='other' / name='其他';\n"
+            "4) 不要返回 markdown，只返回 JSON 数组。"
+        )
+        try:
+            content = self._chat(
+                [
+                    {"role": "system", "content": "你是收藏分类专家，把杂乱标题聚成可执行的简洁分类。只输出 JSON 数组。"},
+                    {"role": "user", "content": prompt},
+                ],
+                json_mode=True,
+                max_tokens=2400,
+                temperature=0.3,
+            )
+            data = _parse_json_lenient(content)
+            # _parse_json_lenient returns dict; for arrays we need to handle wrapping
+            if isinstance(data, dict):
+                # Some models wrap in {"clusters": [...]}; try to unwrap
+                for k in ("clusters", "groups", "categories", "data"):
+                    if isinstance(data.get(k), list):
+                        data = data[k]
+                        break
+            if not isinstance(data, list):
+                # Last-ditch: try to find a JSON array in the text
+                m = re.search(r"\[[\s\S]*\]", content or "")
+                if m:
+                    try:
+                        data = json.loads(m.group(0))
+                    except Exception:
+                        data = None
+            if not isinstance(data, list) or not data:
+                return MockLLMProvider().cluster_titles(titles, target_clusters=target_clusters)
+            # Sanitise each cluster
+            seen_ids: set[str] = set()
+            cleaned: list[dict[str, Any]] = []
+            for c in data:
+                if not isinstance(c, dict):
+                    continue
+                cid = (c.get("id") or "").strip().lower().replace(" ", "-") or f"c{len(cleaned):02d}"
+                # Dedupe ids
+                base = cid
+                k = 1
+                while cid in seen_ids:
+                    cid = f"{base}-{k}"
+                    k += 1
+                seen_ids.add(cid)
+                name = (c.get("name") or "").strip()[:24] or "未命名"
+                desc = (c.get("description") or "").strip()[:60]
+                samples = [s for s in (c.get("sample_titles") or []) if isinstance(s, str)][:4]
+                cleaned.append({
+                    "id": cid,
+                    "name": name,
+                    "description": desc,
+                    "sample_titles": samples,
+                })
+            return cleaned
+        except Exception:
+            return MockLLMProvider().cluster_titles(titles, target_clusters=target_clusters)
 
 
 def _parse_json_lenient(text: str) -> dict[str, Any] | None:

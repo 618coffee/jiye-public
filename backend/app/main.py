@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .store.sqlite_store import SqliteStore
-from .routers import cities, notes, search, settings as settings_router
+from .routers import cities, notes, search, settings as settings_router, inbox
 
 
 def get_store() -> SqliteStore:
@@ -47,6 +47,7 @@ app.include_router(cities.router)
 app.include_router(notes.router)
 app.include_router(search.router)
 app.include_router(settings_router.router)
+app.include_router(inbox.router)
 
 # Serve cached thumbnails
 _thumb_dir = Path(settings.data_dir).resolve() / "thumb"
