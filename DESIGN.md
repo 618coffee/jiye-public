@@ -376,7 +376,27 @@ CREATE TABLE note_chunks (
   text      TEXT,
   image_idx INTEGER                      -- 哪张图，便于前端高亮
 );
+
+-- Inbox 工作流（Phase 1.5 落地）：扫描收藏夹拿到的候选笔记在正式
+-- 入库前先进这个 inbox，人工筛选 + 多标签聚类后再 promote 到 notes。
+CREATE TABLE note_inbox (
+  note_id      TEXT PRIMARY KEY,
+  url          TEXT, title TEXT, cover_url TEXT, author TEXT,
+  status       TEXT,                    -- pending / discarded / promoted
+  cluster_id   TEXT,                    -- is_primary=1 那行的镜像（向后兼容）
+  raw_meta     TEXT,                    -- JSON：xsec_token / xsec_source / page_url
+  discovered_at TEXT, saved_at TEXT, promoted_at TEXT
+);
+CREATE TABLE note_cluster_tags (        -- 多标签：一条笔记最多 2 个簇标签
+  note_id    TEXT, cluster_id TEXT,
+  score      REAL, is_primary INTEGER,
+  source     TEXT, created_at TEXT,
+  PRIMARY KEY (note_id, cluster_id)
+);
+CREATE TABLE inbox_clusters (id, name, description, count, ...);
 ```
+
+> Inbox / 多标签聚类的完整阈值与流程见 [docs/clustering.md](./docs/clustering.md)、爬虫使用见 [docs/crawler.md](./docs/crawler.md)。
 
 ---
 

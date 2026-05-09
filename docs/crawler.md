@@ -71,14 +71,23 @@ uvicorn app.main:app --reload    # 端口 8000
 curl -s localhost:9222/json/version | head -3
 ```
 
-### 1.3 配置环境变量（可选，UI 会用到）
+### 1.3 配置环境变量（可选）
 
 `backend/.env`：
 
 ```bash
 XHS_CDP_ENDPOINT=http://127.0.0.1:9222
+# 下面这条可选 — 不填爬虫会自动发现
 XHS_COLLECTION_URL=https://www.xiaohongshu.com/user/profile/<你的uid>?tab=fav&subTab=note
 ```
+
+**`XHS_COLLECTION_URL` 是可选的**（MediaCrawler 风格的三级 fallback）：
+
+1. 如果调试 Chrome 里有 tab 的 URL 已经像收藏页（带 `tab=fav` / `subTab=note`），直接用
+2. 否则找一个 `/user/profile/<uid>` 的 tab，自动拼上 `?tab=fav&subTab=note` 跳转过去
+3. 都没有 → 在第一个 xhs tab 里读 DOM（header 头像里的 `/user/profile/<uid>` 链接）拿到 uid，自己拼 URL
+
+所以**最简单的玩法**：在调试 Chrome 里随便打开一个 xhs 页面（首页 / 任意笔记都行），登录，直接点「扫描收藏夹」，爬虫自己找路。
 
 ---
 
@@ -86,29 +95,32 @@ XHS_COLLECTION_URL=https://www.xiaohongshu.com/user/profile/<你的uid>?tab=fav&
 
 ### 2.1 一键抓（推荐，UI）
 
-打开 [http://localhost:3000/inbox](http://localhost:3000/inbox)，点 header 上的 **「扫描收藏夹」** 按钮。
+打开 [http://localhost:3000/inbox](http://localhost:3000/inbox)（页面标题「我的收藏」），点 header 上的 **「扫描收藏夹」** 按钮。
 
-走 `POST /api/inbox/scan`，使用 `.env` 里的 `XHS_COLLECTION_URL`。
+走 `POST /api/inbox/scan`。`XHS_COLLECTION_URL` 没设的话用 §1.3 的 fallback 自动发现。
 
-**默认是增量扫描**：xhs 收藏页按收藏时间倒序，爬虫拿到 `note_inbox` 里所有已知 `note_id` 的集合，扫到连续 2 屏全是已知笔记就提前停。所以平时定期点这个按钮，只会抓最近新增的几十条，几秒就跑完。
+**每次扫描都会强制刷新 feed**：爬虫执行 `scrollTo(0)` → `page.reload()` → 重新点击「收藏」tab → `scrollTo(0)`，然后才开始滚。这样 tab 闲置期间新收藏的笔记也能被吃到（xhs 是 SPA，不主动 reload 永远看的是缓存的 feed），mirror MediaCrawler 的「每次新鲜导航」行为。
+
+**默认是增量扫描**：xhs 收藏页按收藏时间倒序，爬虫拿到 `note_inbox` 里所有已知 `note_id` 的集合（`known_note_ids`），扫到连续 `stop_known_streak=2` 屏全是已知笔记就提前停。所以平时定期点这个按钮，只会抓最近新增的几十条，几秒就跑完。
 
 **全量扫描**：按住 `Shift` 点击按钮（或 `POST /api/inbox/scan` 带 `{"full": true}`），关闭增量逻辑，从头滚到底。用于：
 - 第一次冷启动（其实空 inbox 时会自动走全量）
 - 怀疑漏掉了笔记（比如手动取消过收藏后重新收藏）
 - xhs 改版后想重抓 xsec_token
 
-结果直接刷新页面统计 + banner 提示「本次见到 N · 新增 X · 更新 Y · 命中已知笔记后提前结束」。
+**Scan 完会自动跑增量聚类**（`assign_to_existing_clusters`）：把这次新增的 note_id 用 e5 配到最近的现有簇，写 `note_cluster_tags`（多标签）。详见 [docs/clustering.md](./clustering.md)。响应里返回 `auto_cluster: { assigned, unclustered, multi_tagged, by_cluster?, reason? }`。
+
+banner 提示：「本次见到 N · 新增 X · 更新 Y · M 条多标签 · 命中已知笔记后提前结束」。
 
 ### 2.2 CLI（高级用法 / 调试）
 
 ```bash
 cd backend && source .venv/bin/activate
 
-# 试跑（不写库）
-python -m app.crawler.cli scan_inbox --dry-run --debug \
-  --url "https://www.xiaohongshu.com/user/profile/<uid>?tab=fav&subTab=note"
+# 试跑（不写库）— 不带 --url 走自动发现
+python -m app.crawler.cli scan_inbox --dry-run --debug
 
-# 正式
+# 正式 — 强制走某个 URL
 python -m app.crawler.cli scan_inbox \
   --url "https://www.xiaohongshu.com/user/profile/<uid>?tab=fav&subTab=note"
 ```
@@ -118,12 +130,14 @@ python -m app.crawler.cli scan_inbox \
 | flag | 默认 | 说明 |
 |---|---|---|
 | `--cdp` | `http://127.0.0.1:9222` | Chrome 调试端点 |
-| `--url` | (env) | 强制 navigate 到这个 URL |
+| `--url` | (auto) | 强制 navigate 到这个 URL；不传走 §1.3 自动发现 |
 | `--idle` | `4` | 连续 N 次滚动无新内容就停 |
 | `--pause` | `1.4` | 每次滚动后停顿（秒），含随机 jitter |
 | `--max-scrolls` | `400` | 滚动次数硬上限 |
-| `--debug` | off | 打印每次滚动新增数 |
+| `--debug` | off | 打印每次滚动新增数 + tab 选择决策 |
 | `--dry-run` | off | 只打印不写库 |
+
+CLI 目前**不支持**增量模式（不会读 `known_note_ids`），每次跑都是全量。增量逻辑只在 HTTP API 层。
 
 ### 2.3 重复抓是安全的
 
@@ -149,6 +163,8 @@ curl localhost:8000/api/inbox/stats | python -m json.tool
 
 ## 3. Stage 2 — 聚类打标
 
+> 多标签逻辑、阈值、藏底簇详见 [docs/clustering.md](./clustering.md)。这里只讲触发路径。
+
 ### 3.1 触发（UI）
 
 `/inbox` header → **「重新聚类」** 按钮，弹出表单设置目标簇数 / 样本量 / EM 迭代。
@@ -169,14 +185,15 @@ curl -X POST localhost:8000/api/inbox/cluster \
 - `em_iterations` — 0/1/2/3 轮 EM 重分配（推荐 1）
 - `min_similarity` — 低置信度阈值（推荐 0.55）
 
-### 3.3 算法（两阶段）
+### 3.3 算法（两阶段 + 多标签）
 
 1. **LLM 出标签**：从样本里采 N 条标题让 LLM 命名 K 个簇（人能读的中文标签 + 描述）。
-2. **e5 找最近邻**：所有标题 + 簇描述都用 `multilingual-e5-base` 编码，每条标题归到余弦相似度最大的簇。
+2. **e5 找最近邻**：所有标题 + 簇描述都用 `multilingual-e5-base` 编码，对每个簇心算 cosine。
 3. **EM 收敛**（可选）：用簇内标题平均向量重算簇心，再分配，迭代 1-3 次。
-4. **低置信度回退**：max sim < `min_similarity` 的判为「未分类」（`cluster_id = __none__`）。
+4. **多标签打标**：top-1 进主标签；后续候选中满足「与 top-1 cosine 差距 ≤ 0.015 且绝对值 ≥ 0.48」的进副标签，每条最多 2 个。
+5. **低置信度回退**：max sim < `min_similarity` 的判为「未分类」（`__low_conf__`）。
 
-耗时取决于数据规模和所选 provider。簇 + 时间聚合（earliest/latest discovered_at + saved_at + 近 7 日新增数）写入 `inbox_clusters`。
+耗时取决于数据规模和所选 provider。簇 + 时间聚合（earliest/latest discovered_at + saved_at + 近 7 日新增数）写入 `inbox_clusters`；per-note 的多标签写入 `note_cluster_tags`。
 
 ### 3.4 阈值建议
 
@@ -234,9 +251,9 @@ curl -X POST localhost:8000/api/inbox/cluster \
 | 症状 | 解决 |
 |---|---|
 | `Could not attach to Chrome at 127.0.0.1:9222` | Chrome 没用 `--remote-debugging-port=9222` 启动，按 §1.2 重启 |
-| `No xiaohongshu tab found` | 在调试 Chrome 里打开任意 xhs 页 |
-| `Found xiaohongshu tabs but none look like a 收藏 page` | 用 `--url` / `XHS_COLLECTION_URL` 强制指定 |
-| 抓回来全是别人发的笔记 | 你停在了 `/explore`，用 `--url` 直达 profile |
+| `No xiaohongshu tab found` | 调试 Chrome 里没开任何 xhs 页面，随便打开 xhs.com 并登录 |
+| `Could not auto-locate your xhs collection page` | 有 xhs tab 但都不是 profile/收藏，xhs header 也读不到 uid。手动跳到自己 profile 后重试，或在 `XHS_COLLECTION_URL` 里写死 |
+| 抓回来全是别人发的笔记 | 你停在了 `/explore`，用 `--url` 直达 profile；或者在调试 Chrome 里手动跳到你的 profile 页让自动发现走途径 2/3 |
 | 抓回来全是自己发的笔记 | 收藏 tab 没切换，加 `--debug` 看 `tab click attempt` 是否 `clicked=true` |
 | 数量比预期少很多 | 加 `--idle 8 --max-scrolls 800 --pause 2.0` 重跑 |
 | Promote 时弹二维码扫码墙 | 不该再发生（HTTP path 是无 cookie 的）。如果出现，说明落到 SPA fallback 了 — 检查 token 是否丢失（重新 scan 刷 token） |
@@ -261,7 +278,7 @@ curl -X POST localhost:8000/api/inbox/cluster \
 - HTTP 详情：[backend/app/crawler/detail_http.py](../backend/app/crawler/detail_http.py)
 - SPA 详情兜底：[backend/app/crawler/detail.py](../backend/app/crawler/detail.py)
 - 升级管道：[backend/app/services/inbox_promote.py](../backend/app/services/inbox_promote.py)
-- 聚类：[backend/app/services/inbox_clustering.py](../backend/app/services/inbox_clustering.py)
+- 聚类：[backend/app/services/inbox_clustering.py](../backend/app/services/inbox_clustering.py)（详见 [docs/clustering.md](./clustering.md)）
 - API：[backend/app/routers/inbox.py](../backend/app/routers/inbox.py)
 - CLI：[backend/app/crawler/cli.py](../backend/app/crawler/cli.py)
 - UI：[frontend/app/inbox/page.tsx](../frontend/app/inbox/page.tsx)
