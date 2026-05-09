@@ -436,8 +436,8 @@ class SqliteStore(KnowledgeStore):
     def vector_search(self, query_emb: list[float], *, limit: int = 20, city: str | None = None) -> list[dict[str, Any]]:
         chunks = self.chunks_with_embeddings()
         scored: dict[str, dict[str, Any]] = {}
+        all_sims: list[float] = []
         with self._conn() as c:
-            note_city = {}
             if city:
                 rows = c.execute(
                     "SELECT id, primary_city FROM notes WHERE primary_city = ?",
@@ -452,10 +452,32 @@ class SqliteStore(KnowledgeStore):
             sim = _cosine(query_emb, ch["embedding"])
             if sim <= 0:
                 continue
+            all_sims.append(sim)
             nid = ch["note_id"]
             if nid not in scored or sim > scored[nid]["score"]:
                 scored[nid] = {"note_id": nid, "score": sim, "matched_chunks": [ch["text"][:120]]}
-        ordered = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
+        # Per-query baseline. Multilingual e5 has a high cosine floor (~0.8 even
+        # for unrelated CN/EN text), so absolute thresholds don't transfer
+        # between queries. Instead we keep only chunks whose similarity is at
+        # least ``mean + Z * std`` standard deviations above the corpus-wide
+        # mean for *this* query — i.e. results that genuinely stand out.
+        if all_sims:
+            n = len(all_sims)
+            mean = sum(all_sims) / n
+            var = sum((s - mean) ** 2 for s in all_sims) / max(n - 1, 1)
+            std = math.sqrt(var) if var > 0 else 0.0
+            z_cut = mean + 1.5 * std
+            for nid, h in scored.items():
+                # store a normalised relevance score = (sim - mean) / std,
+                # callers can use it for relative ranking.
+                h["raw_cos"] = h["score"]
+                h["z"] = (h["score"] - mean) / std if std > 0 else 0.0
+                h["baseline_mean"] = mean
+                h["baseline_std"] = std
+            kept = [h for h in scored.values() if h["score"] >= z_cut]
+        else:
+            kept = list(scored.values())
+        ordered = sorted(kept, key=lambda x: x["score"], reverse=True)
         return ordered[:limit]
 
     def stale_pois_for_city(self, city: str, *, fresh_window_days: int = 14) -> list[dict[str, Any]]:

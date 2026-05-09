@@ -1,6 +1,7 @@
 """Ingestion: take a raw note dict, run AI pipeline, persist."""
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ..config import settings
@@ -8,6 +9,38 @@ from ..providers import get_embedding_provider, get_llm_provider
 from ..providers.llm import _CITY_HINTS
 from ..store.base import KnowledgeStore
 from . import ocr as ocr_service
+
+
+def _ocr_text_is_meaningful(text: str) -> bool:
+    """Filter out garbage OCR (random alphabet soup, repeated digits, very short).
+
+    RapidOCR sometimes hallucinates text on textureless images (e.g. random
+    photos with no real text), producing strings like ``WARISNDTAGAME`` or
+    ``13333333333333335``. Indexing these would pollute search results.
+    """
+    s = text.strip()
+    if len(s) < 6:
+        return False
+    # Contains at least one CJK char OR a dictionary-shaped word (vowels +
+    # consonants + spaces) — i.e. not just consonant soup.
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff\u3040-\u30ff]", s))
+    if has_cjk:
+        return True
+    letters = re.sub(r"[^A-Za-z]", "", s)
+    if len(letters) < 4:
+        return False
+    # Reject strings with no vowels (a/e/i/o/u) — typical OCR hallucination
+    # is a string of random consonants.
+    has_vowel = bool(re.search(r"[aeiouAEIOU]", letters))
+    if not has_vowel:
+        return False
+    # Reject strings dominated by a single repeated digit.
+    digits = re.sub(r"\D", "", s)
+    if digits and len(digits) >= len(s) * 0.7:
+        unique = set(digits)
+        if len(unique) <= 2:
+            return False
+    return True
 
 
 COUNTRY_FLAGS = {
@@ -113,7 +146,7 @@ def ingest_note(store: KnowledgeStore, raw: dict[str, Any]) -> str:
         # Persist OCR text as searchable chunks (one per image with detected text)
         ocr_chunks: list[dict[str, Any]] = []
         for r in ocr_results:
-            if r.text:
+            if r.text and _ocr_text_is_meaningful(r.text):
                 ocr_chunks.append({
                     "chunk_type": "ocr",
                     "text": r.text,
