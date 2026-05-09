@@ -272,7 +272,7 @@ export default function InboxPage() {
             <InboxIcon className="w-5 h-5" />
           </div>
           <div className="flex-1 min-w-0">
-            <h1 className="text-lg sm:text-xl font-semibold tracking-tight">收件箱</h1>
+            <h1 className="text-lg sm:text-xl font-semibold tracking-tight">我的收藏</h1>
             <p className="text-xs sm:text-sm text-ink-500 mt-0.5">
               {stats ? (
                 <>
@@ -373,18 +373,35 @@ export default function InboxPage() {
                 </button>
               )}
             </div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-ink-400">状态</span>
-              <select
-                value={statusFilter}
-                onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}
-                className="h-9 text-sm rounded-lg border border-ink-200 bg-white px-2 focus:outline-none focus:border-rouge-400"
-              >
-                <option value="pending">待处理</option>
-                <option value="discarded">已丢弃</option>
-                <option value="promoted">已入库</option>
-                <option value="all">全部</option>
-              </select>
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <StatusPill
+                label="待处理"
+                count={pendingCount}
+                active={statusFilter === 'pending'}
+                tone="default"
+                onClick={() => setStatusFilter('pending')}
+              />
+              <StatusPill
+                label="已入库"
+                count={promotedCount}
+                active={statusFilter === 'promoted'}
+                tone="good"
+                onClick={() => setStatusFilter('promoted')}
+              />
+              <StatusPill
+                label="已丢弃"
+                count={discardedCount}
+                active={statusFilter === 'discarded'}
+                tone="warn"
+                onClick={() => setStatusFilter('discarded')}
+              />
+              <StatusPill
+                label="全部"
+                count={pendingCount + promotedCount + discardedCount}
+                active={statusFilter === 'all'}
+                tone="default"
+                onClick={() => setStatusFilter('all')}
+              />
               <span className="text-xs text-ink-400 ml-2 whitespace-nowrap">
                 {loading ? '…' : `${items.length} 条`}
               </span>
@@ -714,6 +731,42 @@ function ClusterChip({
     >
       <span>{label}</span>
       <span className={cn('tabular-nums', active ? 'text-white/70' : 'text-ink-400')}>
+        {count}
+      </span>
+    </button>
+  );
+}
+
+function StatusPill({
+  label,
+  count,
+  active,
+  tone,
+  onClick,
+}: {
+  label: string;
+  count: number;
+  active: boolean;
+  tone: 'default' | 'good' | 'warn';
+  onClick: () => void;
+}) {
+  const activeCls =
+    tone === 'good'
+      ? 'bg-emerald-500 text-white border-emerald-500'
+      : tone === 'warn'
+        ? 'bg-amber-500 text-white border-amber-500'
+        : 'bg-ink-900 text-white border-ink-900';
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'inline-flex items-center gap-1.5 h-8 px-3 rounded-full text-xs border transition',
+        active ? activeCls : 'bg-white border-ink-200 text-ink-700 hover:border-ink-300',
+      )}
+    >
+      <span>{label}</span>
+      <span className={cn('tabular-nums', active ? 'text-white/80' : 'text-ink-400')}>
         {count}
       </span>
     </button>
