@@ -40,8 +40,17 @@ class Settings(BaseSettings):
     # Embedding provider selection: "auto" prefers local e5-small if installed,
     # otherwise Azure → Qwen → Mock. "local" forces e5-small. "azure"/"qwen"/"mock"
     # force a specific provider.
-    embedding_provider: str = "auto"
-
+    embedding_provider: str = "auto"    # Which Hugging Face model id to load when using the local provider.
+    # Recommended choices:
+    #   intfloat/multilingual-e5-small  — 120 MB, 384-d, fast on CPU/MPS
+    #   intfloat/multilingual-e5-base   — 280 MB, 768-d, ~+5pp recall
+    #   intfloat/multilingual-e5-large  — 560 MB, 1024-d, ~+8pp recall
+    embedding_model_name: str = "intfloat/multilingual-e5-small"
+    # Compute device: "auto" → MPS on Apple Silicon, CUDA on NVIDIA, else CPU.
+    embedding_device: str = "auto"
+    # Batch size used when encoding many chunks at once. MPS/CUDA win at ≥32;
+    # CPU sweet spot is ~16-32. Larger uses more memory but is faster.
+    embedding_batch_size: int = 64
     @property
     def has_azure_openai(self) -> bool:
         return bool(self.azure_openai_endpoint and self.azure_openai_api_key)
