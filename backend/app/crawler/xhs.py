@@ -56,6 +56,11 @@ class CrawlerConfig:
     scroll_jitter_s: float = 0.8
     # Hard cap so a runaway scroll can't infinite-loop.
     max_scroll_iterations: int = 400
+    # Incremental mode: stop after this many consecutive scrolls where every
+    # item was already known. xhs sorts the collection page newest-first by
+    # save time, so once we cross into the "old" zone there's no point
+    # scrolling further. Only applies when scan() receives known_note_ids.
+    stop_known_streak: int = 2
     # If True, the crawler logs DOM probe results so users can adapt
     # selectors when xhs changes their HTML.
     debug_dom: bool = False
@@ -67,6 +72,8 @@ class CrawlerResult:
     page_url: str = ""
     iterations: int = 0
     duplicate_seen: int = 0
+    # Set when scan() exited early because the known-streak threshold tripped.
+    early_stopped: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +283,7 @@ class XhsCollectionCrawler:
         *,
         progress_cb: Callable[[CrawlerResult], None] | None = None,
         target_url: str | None = None,
+        known_note_ids: set[str] | None = None,
     ) -> CrawlerResult:
         cfg = self.config
         result = CrawlerResult()
@@ -320,6 +328,7 @@ class XhsCollectionCrawler:
 
             # Scroll until we stop discovering new ids for N consecutive rounds.
             idle = 0
+            known_streak = 0
             import random
             for it in range(cfg.max_scroll_iterations):
                 result.iterations = it + 1
@@ -347,6 +356,31 @@ class XhsCollectionCrawler:
                         break
                 else:
                     idle = 0
+
+                # Incremental early-exit: once every visible item on this
+                # screenful is already in the known set, we've crossed into
+                # the "old" tail of the collection page. A short streak of
+                # such rounds means we can stop.
+                if known_note_ids and fresh:
+                    fresh_ids = {x.get("note_id") for x in fresh if x.get("note_id")}
+                    if fresh_ids and fresh_ids.issubset(known_note_ids):
+                        known_streak += 1
+                        if cfg.debug_dom:
+                            print(
+                                f"[crawler] iter {it}: all {len(fresh_ids)} ids "
+                                f"already known (streak={known_streak})"
+                            )
+                        if known_streak >= cfg.stop_known_streak:
+                            if cfg.debug_dom:
+                                print(
+                                    f"[crawler] known-streak reached "
+                                    f"{known_streak} — incremental stop"
+                                )
+                            result.early_stopped = True
+                            break
+                    else:
+                        known_streak = 0
+
                 if progress_cb and len(result.items) != prev_count:
                     progress_cb(result)
 

@@ -88,6 +88,8 @@ export default function InboxPage() {
     scanned: number;
     inserted: number;
     updated: number;
+    early_stopped?: boolean;
+    incremental?: boolean;
   } | null>(null);
 
   // Initial + after-discard stats refresh
@@ -228,19 +230,28 @@ export default function InboxPage() {
     }
   }
 
-  async function runScan() {
+  async function runScan(opts?: { full?: boolean }) {
     if (scanning) return;
-    if (!confirm(
-      '确认开始扫描小红书收藏夹？\n\n' +
-      '需要在本机已用 --remote-debugging-port=9222 启动并登录小红书的 Chrome。' +
-      '抓取 1000+ 条标题大约 1-2 分钟，期间请勿关闭那个 Chrome 标签页。'
-    )) return;
+    const full = !!opts?.full;
+    const promptMsg = full
+      ? '确认开始**全量**扫描小红书收藏夹？\n\n' +
+        '会从头滚到底，可能需要 2-5 分钟。一般情况只在你怀疑漏掉了笔记时再用。'
+      : '确认开始扫描小红书收藏夹？\n\n' +
+        '会增量更新：xhs 收藏页按收藏时间倒序，扫到连续两屏都是已知笔记就停。' +
+        '如果是上次扫描后新增的笔记不多，几秒就能跑完。';
+    if (!confirm(promptMsg)) return;
     setScanning(true);
     setError(null);
     setLastScan(null);
     try {
-      const r = await api.inboxScan();
-      setLastScan({ scanned: r.scanned, inserted: r.inserted, updated: r.updated });
+      const r = await api.inboxScan(full ? { full: true } : {});
+      setLastScan({
+        scanned: r.scanned,
+        inserted: r.inserted,
+        updated: r.updated,
+        early_stopped: r.early_stopped,
+        incremental: r.incremental,
+      });
       await loadStats();
       startTransition(() => {
         void loadItems(0, false);
@@ -325,8 +336,9 @@ export default function InboxPage() {
           <Button
             variant="soft"
             size="md"
-            onClick={runScan}
+            onClick={(e) => runScan({ full: e.shiftKey })}
             disabled={scanning}
+            title="点击：增量扫描（只抓新增的）；按住 Shift 点击：全量扫描"
           >
             {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <DownloadCloud className="w-4 h-4" />}
             {scanning ? '扫描中…' : '扫描收藏夹'}
@@ -514,7 +526,9 @@ export default function InboxPage() {
             <Card className="p-3 border-sky-200 bg-sky-50/80 text-sm flex items-center gap-2 text-sky-800">
               <DownloadCloud className="w-4 h-4" />
               <span>
-                扫描完成：共 {lastScan.scanned} 条 · 新增 {lastScan.inserted} · 更新 {lastScan.updated}
+                {lastScan.incremental ? '增量扫描' : '全量扫描'}完成：本次见到 {lastScan.scanned} 条 ·
+                新增 {lastScan.inserted} · 更新 {lastScan.updated}
+                {lastScan.early_stopped ? ' · 命中已知笔记后提前结束' : ''}
               </span>
               <button
                 onClick={() => setLastScan(null)}

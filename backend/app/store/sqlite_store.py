@@ -729,6 +729,17 @@ class SqliteStore(KnowledgeStore):
             ).fetchall()
             return {r["status"]: r["n"] for r in rows}
 
+    def all_inbox_ids(self) -> set[str]:
+        """Return every note_id currently in note_inbox (any status).
+
+        Used by the incremental scanner so it can stop early once the
+        crawler hits a streak of already-known notes (xhs collection
+        page is ordered newest-first by save time).
+        """
+        with self._conn() as c:
+            rows = c.execute("SELECT note_id FROM note_inbox").fetchall()
+            return {r["note_id"] for r in rows}
+
     def replace_clusters(self, clusters: list[dict[str, Any]]) -> None:
         """Wipe & rewrite the cluster definitions.
 

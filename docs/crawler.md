@@ -88,7 +88,16 @@ XHS_COLLECTION_URL=https://www.xiaohongshu.com/user/profile/<你的uid>?tab=fav&
 
 打开 [http://localhost:3000/inbox](http://localhost:3000/inbox)，点 header 上的 **「扫描收藏夹」** 按钮。
 
-走 `POST /api/inbox/scan`，使用 `.env` 里的 `XHS_COLLECTION_URL`。1000+ 条大约 1-2 分钟。结果直接刷新页面统计 + banner 提示「新增 X · 更新 Y」。
+走 `POST /api/inbox/scan`，使用 `.env` 里的 `XHS_COLLECTION_URL`。
+
+**默认是增量扫描**：xhs 收藏页按收藏时间倒序，爬虫拿到 `note_inbox` 里所有已知 `note_id` 的集合，扫到连续 2 屏全是已知笔记就提前停。所以平时定期点这个按钮，只会抓最近新增的几十条，几秒就跑完。
+
+**全量扫描**：按住 `Shift` 点击按钮（或 `POST /api/inbox/scan` 带 `{"full": true}`），关闭增量逻辑，从头滚到底。用于：
+- 第一次冷启动（其实空 inbox 时会自动走全量）
+- 怀疑漏掉了笔记（比如手动取消过收藏后重新收藏）
+- xhs 改版后想重抓 xsec_token
+
+结果直接刷新页面统计 + banner 提示「本次见到 N · 新增 X · 更新 Y · 命中已知笔记后提前结束」。
 
 ### 2.2 CLI（高级用法 / 调试）
 

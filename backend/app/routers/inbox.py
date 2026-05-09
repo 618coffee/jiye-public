@@ -170,6 +170,11 @@ async def scan_collection(
       - pause:        scroll pause seconds (default 1.4)
       - max_scrolls:  scroll cap (default 400)
       - dry_run:      bool — if true, returns counts but doesn't upsert
+      - full:         bool — if true, disables incremental early-exit and
+                      scrolls all the way to the bottom (use to backfill
+                      after a long gap or when you suspect missed items).
+                      Default False = incremental: stop after a short
+                      streak of all-already-known items.
 
     Requires a Chrome instance launched with --remote-debugging-port=<cdp>
     and already logged into xiaohongshu.com. Returns inserted/updated counts.
@@ -189,9 +194,22 @@ async def scan_collection(
         debug_dom=False,
     )
     dry_run = bool(payload.get("dry_run"))
+    full_scan = bool(payload.get("full"))
+    # Incremental: hand the crawler our existing inbox ids so it can stop
+    # early once the visible feed is entirely "old". Skipped when full=true
+    # or when the inbox is empty (nothing to dedupe against → cold start).
+    known_ids: set[str] | None = None
+    if not full_scan:
+        try:
+            known_ids = store.all_inbox_ids()
+        except Exception:
+            known_ids = None
+        if known_ids is not None and not known_ids:
+            known_ids = None  # cold start, no point in early-exit logic
+
     crawler = XhsCollectionCrawler(cfg)
     try:
-        result = await crawler.scan(target_url=target_url)
+        result = await crawler.scan(target_url=target_url, known_note_ids=known_ids)
     except CrawlerError as e:
         raise HTTPException(502, f"crawler error: {e}") from e
 
@@ -200,6 +218,7 @@ async def scan_collection(
             "scanned": len(result.items),
             "page_url": result.page_url,
             "dry_run": True,
+            "early_stopped": result.early_stopped,
         }
 
     inbox_payload = [
@@ -225,5 +244,7 @@ async def scan_collection(
         "inserted": counts["inserted"],
         "updated": counts["updated"],
         "page_url": result.page_url,
+        "early_stopped": result.early_stopped,
+        "incremental": known_ids is not None,
         "by_status": store.inbox_status_counts(),
     }
