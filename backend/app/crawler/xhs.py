@@ -118,6 +118,26 @@ _DOM_PROBE_JS = r"""
     const imgEl = card?.querySelector('img') || null;
     const authorEl = card?.querySelector('.author a, .author .name, .name') || null;
 
+    // xhs hides xsec_token on a SECOND anchor inside the card (typically
+    // the .cover anchor that points at /user/profile/<author>/<note_id>?xsec_token=...).
+    // The bare /explore/<id> anchor we matched above does not carry it.
+    // We scan all anchors in the card and pull the first xsec_token we find.
+    let xsecToken = '';
+    let xsecSource = '';
+    if (card) {
+      const anchors = card.querySelectorAll('a[href*="xsec_token="]');
+      for (const a of anchors) {
+        const h = a.getAttribute('href') || '';
+        const tm = h.match(/xsec_token=([^&"]+)/);
+        if (tm && tm[1]) {
+          xsecToken = decodeURIComponent(tm[1]);
+          const sm = h.match(/xsec_source=([^&"]+)/);
+          xsecSource = sm ? decodeURIComponent(sm[1]) : '';
+          break;
+        }
+      }
+    }
+
     items.push({
       note_id: noteId,
       url: (() => {
@@ -131,6 +151,8 @@ _DOM_PROBE_JS = r"""
       title: (titleEl?.innerText || titleEl?.textContent || '').trim().slice(0, 200),
       cover_url: imgEl?.getAttribute('src') || imgEl?.getAttribute('data-src') || null,
       author: (authorEl?.innerText || authorEl?.textContent || '').trim().slice(0, 80) || null,
+      xsec_token: xsecToken || null,
+      xsec_source: xsecSource || null,
     });
   }
   return items;

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..crawler.detail import DetailResult, XhsDetailCrawler
+from ..crawler.detail_http import fetch_note_detail_http
 from ..crawler.xhs import CrawlerConfig, CrawlerError
 from ..store.sqlite_store import SqliteStore
 from .ingest import ingest_note
@@ -130,14 +131,69 @@ async def _promote_async(
     # immediately even if a single request takes a while.
     store.set_inbox_status([nid for nid, _, _ in pending], "processing")
 
+    # ---- Phase 1: try the cookie-less HTTP path for every note that has an
+    # ``xsec_token`` stashed in raw_meta. This is much faster, more reliable,
+    # and never triggers xhs's QR-wall anti-bot. We fall back to the SPA-click
+    # crawler only for notes the HTTP path can't service (no token / token
+    # expired / __INITIAL_STATE__ missing).
+    needs_spa: list[tuple[str, str, dict[str, Any]]] = []
+    import random as _rnd
+    for i, (nid, url, inbox_row) in enumerate(pending):
+        meta = inbox_row.get("raw_meta") or {}
+        token = meta.get("xsec_token")
+        source = meta.get("xsec_source") or "pc_user"
+        if not token:
+            needs_spa.append((nid, url, inbox_row))
+            continue
+        try:
+            detail = await fetch_note_detail_http(
+                nid, xsec_token=token, xsec_source=source,
+            )
+        except Exception as e:
+            detail = DetailResult(
+                note_id=nid, url=url, ok=False,
+                error=f"http path crashed: {type(e).__name__}: {e}",
+            )
+        if detail.ok:
+            _record(store, out, nid, inbox_row, detail)
+            # gentle pacing between HTTP requests too — xhs SSR will rate-limit
+            if i + 1 < len(pending):
+                await asyncio.sleep(0.6 + _rnd.random() * 0.8)
+        else:
+            # HTTP path failed (token expired, deleted note, layout drift...)
+            # Queue for SPA fallback.
+            needs_spa.append((nid, url, inbox_row))
+
+    # ---- Phase 2: SPA-click fallback for the leftovers. This requires Chrome
+    # over CDP and is what previously triggered QR walls — only used when HTTP
+    # genuinely couldn't service the note.
+    if not needs_spa:
+        out.duration_s = time.monotonic() - started
+        return out
+
     cfg = CrawlerConfig(cdp_endpoint=cdp_endpoint, debug_dom=debug_dom)
+
+    # All notes promoted in one batch share the same 收藏 feed (it's the
+    # logged-in user's own collection). The crawler can auto-discover that
+    # feed from any xhs tab, so we just pass through the first stored
+    # page_url as a hint — open_collection() falls back to auto-discovery
+    # if the hint is missing or doesn't look like a profile URL.
+    hint: str | None = None
+    for _, _, row in needs_spa:
+        candidate = (row.get("raw_meta") or {}).get("page_url")
+        if candidate:
+            hint = candidate
+            break
+
     try:
         async with XhsDetailCrawler(cfg) as crawler:
-            for i, (nid, url, inbox_row) in enumerate(pending):
-                detail: DetailResult = await crawler.fetch_one(nid, url)
+            await crawler.open_collection(hint)
+            for i, (nid, url, inbox_row) in enumerate(needs_spa):
+                detail = await crawler.fetch_one(
+                    nid, url_for_logging=url,
+                )
                 _record(store, out, nid, inbox_row, detail)
-                # Pause between notes to be polite to xhs.
-                if i + 1 < len(pending):
+                if i + 1 < len(needs_spa):
                     import random
                     await asyncio.sleep(
                         per_note_pause_s + random.random() * per_note_jitter_s
@@ -185,6 +241,15 @@ def _record(
     # Build the ``raw`` dict that ingest_note() expects. Inbox row supplies
     # the URL + saved_at; the detail crawl supplies title/body/images/etc.
     # Detail-side title beats inbox title (more accurate, longer, cleaner).
+    #
+    # Time fields:
+    #   - ``published_at`` comes from the detail modal (".bottom-container .date" etc).
+    #     xhs renders things like "06-15 上海" / "2024-09-03" / "3 天前" — we keep
+    #     the raw string so downstream can parse if/when needed.
+    #   - ``saved_at`` is NOT exposed anywhere on xhs web (neither feed nor modal).
+    #     We fall back to ``discovered_at`` (the time we first scanned the inbox row),
+    #     which is an upper-bound proxy for the real collection time.
+    saved_at = inbox_row.get("saved_at") or inbox_row.get("discovered_at")
     raw = {
         "id": note_id,
         "url": inbox_row.get("url") or detail.url,
@@ -193,7 +258,7 @@ def _record(
         "author": detail.author or inbox_row.get("author"),
         "cover": detail.cover or inbox_row.get("cover_url"),
         "images": detail.images or [],
-        "saved_at": inbox_row.get("saved_at"),
+        "saved_at": saved_at,
         "published_at": detail.published_at,
         "source": "inbox_promote",
     }

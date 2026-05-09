@@ -118,11 +118,18 @@ CREATE INDEX IF NOT EXISTS idx_inbox_cluster ON note_inbox(cluster_id);
 CREATE INDEX IF NOT EXISTS idx_inbox_saved_at ON note_inbox(saved_at DESC);
 
 CREATE TABLE IF NOT EXISTS inbox_clusters (
-  id           TEXT PRIMARY KEY,
-  name         TEXT NOT NULL,
-  description  TEXT,
-  count        INTEGER DEFAULT 0,
-  created_at   TEXT NOT NULL
+  id                     TEXT PRIMARY KEY,
+  name                   TEXT NOT NULL,
+  description            TEXT,
+  count                  INTEGER DEFAULT 0,
+  created_at             TEXT NOT NULL,
+  -- Time aggregates over the cluster's member notes (computed at
+  -- cluster_inbox() time, NULL for clusters created before the migration).
+  earliest_discovered_at TEXT,
+  latest_discovered_at   TEXT,
+  earliest_saved_at      TEXT,
+  latest_saved_at        TEXT,
+  notes_added_last_7d    INTEGER
 );
 """
 
@@ -171,6 +178,22 @@ class SqliteStore(KnowledgeStore):
             if "source" not in cols:
                 # Tag where each note came from: seed | crawler | share | manual
                 c.execute("ALTER TABLE notes ADD COLUMN source TEXT DEFAULT 'seed'")
+
+            # inbox_clusters: time aggregates added in May 2026.
+            cluster_cols = {
+                r[1] for r in
+                c.execute("PRAGMA table_info(inbox_clusters)").fetchall()
+            }
+            for col in (
+                "earliest_discovered_at", "latest_discovered_at",
+                "earliest_saved_at", "latest_saved_at",
+                "notes_added_last_7d",
+            ):
+                if col not in cluster_cols:
+                    sql_type = "INTEGER" if col == "notes_added_last_7d" else "TEXT"
+                    c.execute(
+                        f"ALTER TABLE inbox_clusters ADD COLUMN {col} {sql_type}"
+                    )
 
     # ---------- writes ----------
 
@@ -709,8 +732,11 @@ class SqliteStore(KnowledgeStore):
     def replace_clusters(self, clusters: list[dict[str, Any]]) -> None:
         """Wipe & rewrite the cluster definitions.
 
-        Each cluster: {id, name, description, count}. Note rows keep their
-        cluster_id pointers; UI is responsible for re-assigning if id changes.
+        Each cluster: ``{id, name, description, count}`` plus optional time
+        aggregates (``earliest_discovered_at``, ``latest_discovered_at``,
+        ``earliest_saved_at``, ``latest_saved_at``, ``notes_added_last_7d``).
+        Note rows keep their cluster_id pointers; UI is responsible for
+        re-assigning if id changes.
         """
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
@@ -718,11 +744,40 @@ class SqliteStore(KnowledgeStore):
             c.execute("DELETE FROM inbox_clusters")
             for cl in clusters:
                 c.execute(
-                    """INSERT INTO inbox_clusters (id, name, description, count, created_at)
-                       VALUES (?,?,?,?,?)""",
-                    (cl["id"], cl["name"], cl.get("description"),
-                     cl.get("count", 0), now),
+                    """INSERT INTO inbox_clusters (
+                         id, name, description, count, created_at,
+                         earliest_discovered_at, latest_discovered_at,
+                         earliest_saved_at, latest_saved_at,
+                         notes_added_last_7d
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        cl["id"], cl["name"], cl.get("description"),
+                        cl.get("count", 0), now,
+                        cl.get("earliest_discovered_at"),
+                        cl.get("latest_discovered_at"),
+                        cl.get("earliest_saved_at"),
+                        cl.get("latest_saved_at"),
+                        cl.get("notes_added_last_7d"),
+                    ),
                 )
+
+    def get_inbox_times(
+        self, note_ids: list[str]
+    ) -> list[tuple[str | None, str | None]]:
+        """Return ``(discovered_at, saved_at)`` tuples for the given note IDs.
+
+        Order is not guaranteed — callers should aggregate, not zip.
+        """
+        if not note_ids:
+            return []
+        with self._conn() as c:
+            placeholders = ",".join("?" * len(note_ids))
+            rows = c.execute(
+                f"SELECT discovered_at, saved_at FROM note_inbox "
+                f"WHERE note_id IN ({placeholders})",
+                note_ids,
+            ).fetchall()
+            return [(r["discovered_at"], r["saved_at"]) for r in rows]
 
     def list_clusters(self) -> list[dict[str, Any]]:
         with self._conn() as c:

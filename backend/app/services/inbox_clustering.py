@@ -17,10 +17,40 @@ import random
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..providers import get_embedding_provider, get_llm_provider
 from ..store import KnowledgeStore
+
+
+def _time_aggregates(store: KnowledgeStore, note_ids: list[str]) -> dict[str, Any]:
+    """Compute time-aggregate fields for a cluster of note IDs.
+
+    Returns a dict with ``earliest_discovered_at``, ``latest_discovered_at``,
+    ``earliest_saved_at``, ``latest_saved_at``, ``notes_added_last_7d``.
+    All fields default to ``None``/``0`` when no underlying data exists
+    (e.g. ``saved_at`` is unpopulated for current xhs feed scans).
+    """
+    if not note_ids or not hasattr(store, "get_inbox_times"):
+        return {
+            "earliest_discovered_at": None,
+            "latest_discovered_at": None,
+            "earliest_saved_at": None,
+            "latest_saved_at": None,
+            "notes_added_last_7d": 0,
+        }
+    times = store.get_inbox_times(note_ids)  # type: ignore[attr-defined]
+    discs = [d for d, _ in times if d]
+    saves = [s for _, s in times if s]
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    return {
+        "earliest_discovered_at": min(discs) if discs else None,
+        "latest_discovered_at": max(discs) if discs else None,
+        "earliest_saved_at": min(saves) if saves else None,
+        "latest_saved_at": max(saves) if saves else None,
+        "notes_added_last_7d": sum(1 for d in discs if d >= cutoff),
+    }
 
 
 @dataclass
@@ -201,18 +231,23 @@ def cluster_inbox(
     for c in proposed:
         members = assignments.get(c["id"], [])
         if members:
+            agg = _time_aggregates(store, members)
             cluster_records.append({
                 "id": c["id"],
                 "name": c["name"],
                 "description": c["description"],
                 "count": len(members),
+                **agg,
             })
     if low_confidence > 0:
+        members = assignments[LOW_CONF_ID]
+        agg = _time_aggregates(store, members)
         cluster_records.append({
             "id": LOW_CONF_ID,
             "name": "其他（低置信度）",
             "description": "e5 余弦相似度低于阈值的零散收藏",
             "count": low_confidence,
+            **agg,
         })
     store.replace_clusters(cluster_records)
 

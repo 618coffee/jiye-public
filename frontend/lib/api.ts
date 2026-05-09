@@ -121,6 +121,13 @@ export interface InboxCluster {
   description: string | null;
   count: number;
   created_at: string;
+  // Time aggregates over member notes (filled by cluster_inbox; may be null
+  // for old clusters or when the underlying inbox rows have no time data).
+  earliest_discovered_at?: string | null;
+  latest_discovered_at?: string | null;
+  earliest_saved_at?: string | null;
+  latest_saved_at?: string | null;
+  notes_added_last_7d?: number | null;
 }
 
 export interface InboxStats {

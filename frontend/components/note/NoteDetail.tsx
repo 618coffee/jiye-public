@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ArrowLeft, ExternalLink, ChevronLeft, ChevronRight } from 'lucide-react';
@@ -12,6 +13,7 @@ import { SmartImage } from '@/components/ui/SmartImage';
 import { freshnessLabel } from '@/lib/utils';
 
 export function NoteDetail({ note }: { note: Note }) {
+  const router = useRouter();
   const [idx, setIdx] = useState(0);
   const images = note.images.length > 0 ? note.images : [note.cover].filter(Boolean) as string[];
   const total = Math.max(images.length, 1);
@@ -25,13 +27,23 @@ export function NoteDetail({ note }: { note: Note }) {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <Link
-          href={note.primary_city ? `/city/${encodeURIComponent(note.primary_city)}` : '/'}
+        <button
+          type="button"
+          onClick={() => {
+            // Prefer real browser back so /inbox → /note → back returns to /inbox.
+            if (typeof window !== 'undefined' && window.history.length > 1) {
+              router.back();
+            } else if (note.primary_city) {
+              router.push(`/city/${encodeURIComponent(note.primary_city)}`);
+            } else {
+              router.push('/');
+            }
+          }}
           className="inline-flex items-center gap-1 text-sm text-ink-500 hover:text-ink-800"
         >
           <ArrowLeft className="w-3.5 h-3.5" />
-          返回 {note.primary_city ? note.primary_city : '首页'}
-        </Link>
+          返回
+        </button>
         {note.url && (
           <a
             href={note.url}

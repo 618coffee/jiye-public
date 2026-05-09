@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState, useTransition } from 'react';
+import { useRouter } from 'next/navigation';
 import {
   Inbox as InboxIcon,
   RefreshCw,
@@ -160,8 +161,19 @@ export default function InboxPage() {
 
   async function promoteSelected() {
     if (selected.size === 0 || promoting) return;
-    const ids = [...selected];
-    if (!confirm(
+    // Skip notes already in the main library — re-promote would no-op or duplicate.
+    const promotedSet = new Set(
+      items.filter((it) => it.status === 'promoted').map((it) => it.note_id),
+    );
+    const ids = [...selected].filter((id) => !promotedSet.has(id));
+    if (ids.length === 0) {
+      alert('所选笔记都已经在主库里了，无需再次升级。');
+      return;
+    }
+    if (ids.length < selected.size) {
+      const skipped = selected.size - ids.length;
+      if (!confirm(`已自动跳过 ${skipped} 条已入库笔记。继续升级剩余 ${ids.length} 条？`)) return;
+    } else if (!confirm(
       `确认把这 ${ids.length} 条加工进知识库？\n\n` +
       `每条会自动打开详情页 → LLM 摘要 → 抽取 POI → 写入主库。` +
       `预计每条 5-10 秒，期间请保持小红书 Chrome 标签页打开且已登录。`
@@ -562,6 +574,9 @@ function ClusterSidebar({
           description={c.description}
           count={c.count}
           isCatchAll={c.id === '__low_conf__'}
+          earliestDiscoveredAt={c.earliest_discovered_at}
+          latestDiscoveredAt={c.latest_discovered_at}
+          notesAddedLast7d={c.notes_added_last_7d}
         />
       ))}
     </div>
@@ -576,6 +591,9 @@ function SidebarRow({
   count,
   emphasis,
   isCatchAll,
+  earliestDiscoveredAt,
+  latestDiscoveredAt,
+  notesAddedLast7d,
 }: {
   active: boolean;
   onClick: () => void;
@@ -584,7 +602,16 @@ function SidebarRow({
   count: number;
   emphasis?: boolean;
   isCatchAll?: boolean;
+  earliestDiscoveredAt?: string | null;
+  latestDiscoveredAt?: string | null;
+  notesAddedLast7d?: number | null;
 }) {
+  // Build a single-line freshness string when we have any time data.
+  const freshness = formatClusterFreshness(
+    earliestDiscoveredAt,
+    latestDiscoveredAt,
+    notesAddedLast7d,
+  );
   return (
     <button
       onClick={onClick}
@@ -609,6 +636,9 @@ function SidebarRow({
           {description && (
             <div className="text-[11px] text-ink-400 line-clamp-1 mt-0.5">{description}</div>
           )}
+          {freshness && (
+            <div className="text-[10.5px] text-ink-400 line-clamp-1 mt-0.5">{freshness}</div>
+          )}
         </div>
         <span
           className={cn(
@@ -621,6 +651,44 @@ function SidebarRow({
       </div>
     </button>
   );
+}
+
+/** Render a compact "earliest ~ latest · last-7d" string for cluster cards. */
+function formatClusterFreshness(
+  earliest: string | null | undefined,
+  latest: string | null | undefined,
+  last7d: number | null | undefined,
+): string | null {
+  const parts: string[] = [];
+  if (earliest && latest) {
+    const fmt = (iso: string) => new Date(iso).toLocaleDateString('zh-CN', {
+      month: 'numeric', day: 'numeric',
+    });
+    const a = fmt(earliest);
+    const b = fmt(latest);
+    parts.push(a === b ? `🕐 ${a}` : `🕐 ${a} – ${b}`);
+  }
+  if (last7d && last7d > 0) {
+    parts.push(`近7天 ${last7d}`);
+  }
+  return parts.length ? parts.join(' · ') : null;
+}
+
+/** Compact relative-time string in Chinese: 刚刚 / N分钟前 / N小时前 / N天前 / N月前. */
+function formatRelativeTime(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (Number.isNaN(ms) || ms < 0) return '';
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return '刚刚';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}分钟前`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}小时前`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}天前`;
+  const mo = Math.floor(day / 30);
+  if (mo < 12) return `${mo}个月前`;
+  return `${Math.floor(mo / 12)}年前`;
 }
 
 function ClusterChip({
@@ -661,15 +729,21 @@ function InboxCard({
   selected: boolean;
   onToggle: () => void;
 }) {
+  const router = useRouter();
   const tone = STATUS_TONE[item.status];
   const label = STATUS_LABEL[item.status];
+  const isPromoted = item.status === 'promoted';
   return (
     <Card
       className={cn(
         'overflow-hidden card-lift cursor-pointer relative group flex flex-col',
         selected && 'ring-2 ring-rouge-400 ring-offset-2 ring-offset-mesh',
       )}
-      onClick={onToggle}
+      onClick={() => {
+        if (isPromoted) router.push(`/note/${item.note_id}`);
+        else onToggle();
+      }}
+      title={isPromoted ? '点击查看主库正文' : undefined}
     >
       <div className="relative aspect-[4/5] overflow-hidden bg-ink-100">
         <SmartImage
@@ -678,8 +752,14 @@ function InboxCard({
           fallbackSeed={item.note_id}
           className="w-full h-full transition-transform duration-700 ease-out group-hover:scale-[1.04]"
         />
-        {/* Checkbox overlay */}
-        <div
+        {/* Checkbox overlay — still works on promoted cards (for discard / multi-select) */}
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggle();
+          }}
+          aria-label={selected ? '取消选择' : '选择'}
           className={cn(
             'absolute top-2 left-2 w-6 h-6 rounded-md flex items-center justify-center transition',
             selected
@@ -688,7 +768,7 @@ function InboxCard({
           )}
         >
           {selected ? <CheckSquare className="w-4 h-4" /> : <Square className="w-4 h-4" />}
-        </div>
+        </button>
         {item.status !== 'pending' && (
           <div className="absolute top-2 right-2">
             <Badge tone={tone}>{label}</Badge>
@@ -705,6 +785,11 @@ function InboxCard({
         <div className="flex items-center justify-between gap-2 mt-auto pt-1">
           <div className="text-[11px] text-ink-400 line-clamp-1 flex-1 min-w-0">
             {item.author || '匿名'}
+            {item.discovered_at && (
+              <span className="ml-1.5 text-ink-300">
+                · {formatRelativeTime(item.discovered_at)}发现
+              </span>
+            )}
           </div>
           {item.url && (
             <a

@@ -71,8 +71,16 @@ async def cmd_scan_inbox(args: argparse.Namespace) -> int:
             "cover_url": it.get("cover_url"),
             "author": it.get("author"),
             "saved_at": None,  # the list view doesn't expose this
-            "raw_meta": {"discovered_via": "xhs_collection_crawler",
-                          "page_url": result.page_url},
+            "raw_meta": {
+                "discovered_via": "xhs_collection_crawler",
+                "page_url": result.page_url,
+                # Captured for the cookie-less HTTP detail fetcher (route B).
+                # xsec_token is required by xhs's SSR endpoint and lives on a
+                # secondary anchor inside each note card. Tokens expire after
+                # a few hours — re-scan to refresh.
+                "xsec_token": it.get("xsec_token"),
+                "xsec_source": it.get("xsec_source") or "pc_user",
+            },
         }
         for it in result.items
     ]
