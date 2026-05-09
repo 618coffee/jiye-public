@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     #   intfloat/multilingual-e5-small  — 120 MB, 384-d, fast on CPU/MPS
     #   intfloat/multilingual-e5-base   — 280 MB, 768-d, ~+5pp recall
     #   intfloat/multilingual-e5-large  — 560 MB, 1024-d, ~+8pp recall
-    embedding_model_name: str = "intfloat/multilingual-e5-small"
+    embedding_model_name: str = "intfloat/multilingual-e5-base"
     # Compute device: "auto" → MPS on Apple Silicon, CUDA on NVIDIA, else CPU.
     embedding_device: str = "auto"
     # Batch size used when encoding many chunks at once. MPS/CUDA win at ≥32;

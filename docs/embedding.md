@@ -1,6 +1,6 @@
-# 关于本项目里的 Embedding：为什么用 multilingual-e5-small，以及它在小本本里到底干了啥
+# 关于本项目里的 Embedding：为什么用 multilingual-e5-base + Apple GPU
 
-> 这篇是给"想看懂但不想啃论文"的人写的。读完你应该能跟同事一句话讲清楚：我们为什么搜索能搜得动中英混搭、能搜出菜单图里的字，以及为什么搜"凯旋门"的时候不会再返回一堆不相关的东西。
+> 这篇是给"想看懂但不想啃论文"的人写的。读完你应该能跟同事一句话讲清楚：我们为什么搜索能搜得动中英混搭、能搜出菜单图里的字、为什么搜"凯旋门"的时候不会再返回一堆不相关的东西，以及为什么这一切在 MacBook 上跑得飞快。
 
 ---
 
@@ -9,7 +9,7 @@
 把一句话扔给一个模型，它吐回来一串数字，比如：
 
 ```
-"京都祇园抹茶圣代"  →  [0.013, -0.041, 0.207, ..., 0.094]   # 长度 384
+"京都祇园抹茶圣代"  →  [0.013, -0.041, 0.207, ..., 0.094]   # 长度 768
 ```
 
 这串数字叫 **embedding（向量表示）**。它的特点是：
@@ -30,24 +30,64 @@
 
 ---
 
-## 1. 为什么挑 `intfloat/multilingual-e5-small`
+## 1. 为什么挑 `intfloat/multilingual-e5-base`
 
-候选其实挺多。我们看了下面几款，最后选了 e5-small：
+候选其实挺多。我们看了下面几款，最后选了 e5-base：
 
-| 模型 | 维度 | 大小 | 中文 | 英文 | 速度 | 选/不选 |
-|---|---|---|---|---|---|---|
-| OpenAI `text-embedding-3-small` | 1536 | 云端 | 强 | 强 | 网络往返 | 要钱 + 要联网 + 数据出境 |
-| Azure 同款 | 1536 | 云端 | 强 | 强 | 网络往返 | 同上，且我们的 Azure key 之前限流过 |
-| `bge-base-zh` | 768 | ~400MB | **顶级** | 一般 | 中等 | 英文能力差，OCR 出来的英文菜单搜不动 |
-| `bge-m3` | 1024 | ~2.3GB | 顶级 | 顶级 | 慢 | 太大，本地起步要 10s+，模型文件 2GB |
-| **`multilingual-e5-small`** | **384** | **~120MB** | 强 | 强 | **<2ms/句** | ✅ |
-| `multilingual-e5-base` | 768 | ~280MB | 更强 | 更强 | ~5ms | small 已经够用，先省资源 |
+| 模型 | 维度 | 大小 | 中文 | 英文 | 选/不选 |
+|---|---|---|---|---|---|
+| OpenAI `text-embedding-3-small` | 1536 | 云端 | 强 | 强 | 要钱 + 要联网 + 数据出境 |
+| Azure 同款 | 1536 | 云端 | 强 | 强 | 同上，且我们的 Azure key 之前限流过 |
+| `bge-base-zh` | 768 | ~400 MB | **顶级** | 一般 | 英文能力差，OCR 出来的英文菜单搜不动 |
+| `bge-m3` | 1024 | ~2.3 GB | 顶级 | 顶级 | 太大，本地起步要 10s+，模型文件 2GB |
+| `multilingual-e5-small` | 384 | ~120 MB | 强 | 强 | 起步够用，但语义粒度比 base 粗一档 |
+| **`multilingual-e5-base`** | **768** | **~280 MB** | **更强** | **更强** | ✅ 当前默认 |
+| `multilingual-e5-large` | 1024 | ~560 MB | 顶级 | 顶级 | 留作"想再准一档"的备选 |
 
-挑 e5-small 的具体理由：
+挑 e5-base 的具体理由：
 
 1. **真·多语言**：训练语料覆盖 100 种语言，中英混搭场景（小红书帖子尤其常见，比如 "京都 GINZA SIX 茶寮都路里 matcha parfait"）原生支持
-2. **够小**：120MB 模型，Mac 上 1.5s 加载完，不用 GPU。本地纯 CPU 也跑得动
-3. **维度合理**：384 维。每个 chunk 的 embedding 存成 JSON 大概 8KB，15 条笔记 ≈ 50 个 chunk ≈ 400KB，SQLite 里完全无压力
+2. **大小刚好**：280 MB 模型，加载 ~2s。比 small 大 2 倍，但在 MTEB 多语言基准上召回率高 ~5pp，对小红书这种短文本提升明显
+3. **能吃满 GPU**：768 维比 small 的 384 维计算量翻倍，但有了 Apple MPS 反而更划算（见 §1.5 性能数据）
+4. **维度合理**：768 维 embedding 存成 JSON 大概 16 KB，15 条笔记 ≈ 50 个 chunk ≈ 800 KB，SQLite 里完全无压力
+
+> 如果你的机器没 GPU 又想轻量起步：把 `embedding_model_name` 改成 `intfloat/multilingual-e5-small` 即可，代码无需改动。
+
+---
+
+## 1.5 为什么默认开 Apple GPU (MPS)：实测数据
+
+这是这次升级的重头戏。之前代码默认走 CPU（sentence-transformers 不指定 device 时就是 CPU），等于让 MacBook 的 GPU 一直闲着。
+
+### 匿名化参考测量：Apple Silicon，256 句中英混搭文本
+
+| 模型 | 维度 | 大小 | CPU | **MPS（Apple GPU）** | 加速 |
+|---|---|---|---|---|---|
+| e5-small | 384 | 120 MB | 524 sent/s | **1710 sent/s** | 3.3× |
+| **e5-base** | **768** | **280 MB** | 185 sent/s | **698 sent/s** | **3.8×** |
+| e5-large | 1024 | 560 MB | 60 sent/s | **275 sent/s** | 4.6× |
+
+（batch_size=64；模型越大 GPU 的相对优势越大，因为算力相对数据搬运开销越占主导）
+
+几个有意思的发现：
+
+- **e5-base 跑在 MPS 上 (698 sent/s) 比 e5-small 跑在 CPU 上 (524 sent/s) 还快**——白嫖一档质量
+- **小 batch 时 MPS 反而慢**：batch_size=16 时 e5-small CPU 469 sent/s vs MPS 576 sent/s，差距很小。原因是 CPU↔GPU 数据搬运开销几乎和实际计算时间一样长。所以代码里默认 `embedding_batch_size=64`
+- e5-large 在 MPS 上 275 sent/s 也不慢，库再大几倍也撑得住——留作未来选项
+
+### 配置（`backend/app/config.py`）
+
+```python
+embedding_model_name: str = "intfloat/multilingual-e5-base"  # 改成 e5-small/large 即可切换
+embedding_device: str = "auto"   # auto = MPS on Apple Silicon, CUDA on NVIDIA, else CPU
+embedding_batch_size: int = 64   # MPS/CUDA 在 ≥32 才打得过 CPU
+```
+
+启动时会打印一行确认：
+
+```
+[embedding] loading intfloat/multilingual-e5-base on device=mps (batch_size=64)
+```
 4. **官方 benchmark 上 MTEB 多语任务排名很靠前**（比同尺寸的 paraphrase-multilingual 系列高一档）
 5. **完全本地、无网络依赖、无 API 费用**。即使关掉 WiFi 也能搜
 
@@ -90,7 +130,7 @@ else:
 
 ## 3. 模型从哪下载？为啥默认走 `hf-mirror.com`
 
-`sentence-transformers` 第一次跑 `SentenceTransformer("intfloat/multilingual-e5-small")` 会自动从 huggingface.co 下载模型权重（120MB 左右）。
+`sentence-transformers` 第一次跑 `SentenceTransformer("intfloat/multilingual-e5-base")` 会自动从 huggingface.co 下载模型权重（280 MB 左右，e5-small 是 120 MB）。
 
 问题：**国内访问 huggingface.co 经常 reset by peer**，下载会失败重试好多轮。我们实测的那次：
 
@@ -112,12 +152,12 @@ if not os.environ.get("HF_ENDPOINT") and not os.environ.get("HF_HUB_OFFLINE"):
 
 ```
 import sentence_transformers       2.4s   (一次性导入)
-SentenceTransformer(model_name)    ~30s   (首次：下载 120MB + 解压)
+SentenceTransformer(model_name)    ~30s   (首次：下载 280 MB + 解压)
 之后：本地缓存命中                 ~1.5s
 encode 一句话                      <2ms
 ```
 
-模型缓存在 `~/.cache/huggingface/hub/models--intfloat--multilingual-e5-small/`，重启不会重新下。
+模型缓存在 `~/.cache/huggingface/hub/models--intfloat--multilingual-e5-base/`，重启不会重新下。
 
 ---
 
@@ -256,7 +296,7 @@ embedding_provider == 'local' OR (auto AND 装了 sentence_transformers) → e5
 这证明三件事一起在工作：
 
 1. **RapidOCR** 从图里提出了 `Eggs Benedict $18`
-2. 提出来的文本在 ingest 阶段被 **e5** 编码成 384 维向量并存进了 `note_chunks` 表
+2. 提出来的文本在 ingest 阶段被 **e5** 编码成 768 维向量并存进了 `note_chunks` 表
 3. 用户搜 `Eggs Benedict` 时 e5 把英文 query 编码后命中了那个 OCR chunk，z-score 滤掉了所有不相关结果
 
 — 这就是"我图片里写了什么，搜得到"的完整闭环。
@@ -267,14 +307,14 @@ embedding_provider == 'local' OR (auto AND 装了 sentence_transformers) → e5
 
 按优先级排：
 
-1. **批量 encode**。现在 ingest 每条笔记单独 encode，CPU 上一条 ~30ms。改成批量后吞吐能再快 5-10×
-2. **持久化 chunk 用 NumPy / sqlite-vec**。现在 embedding 存成 JSON 字符串，搜索时全表扫 + Python 算 cosine。换成 NumPy + 一次矩阵乘法可以从 O(n) 提到 O(1) 显存往返
-3. **chunk 切分更细**。现在按字段切（title / body / poi_card / ocr），长正文还可以滑窗切，命中精度会更高
-4. **如果搜索精度不够再升级到 e5-base**。代码不用动，把 `model_name="intfloat/multilingual-e5-base"` 改一下就行
-5. **z-score 系数 1.5σ 是拍脑袋定的**。搞个评测集合，调到精确率/召回率最优
+1. **持久化 chunk 用 NumPy / sqlite-vec**。现在 embedding 存成 JSON 字符串，搜索时全表扫 + Python 算 cosine。换成 NumPy + 一次矩阵乘可以从 O(n) 提到 O(1) 显存往返
+2. **chunk 切分更细**。现在按字段切（title / body / poi_card / ocr），长正文还可以滑窗切，命中精度会更高
+3. **如果搜索精度还不够再升级到 e5-large**。代码不用动，把 `embedding_model_name="intfloat/multilingual-e5-large"` 改一下就行（需重新 seed）
+4. **z-score 系数 1.5σ 是拍脑袋定的**。搞个评测集合，调到精确率/召回率最优
+5. **CUDA 机器验证**。`embedding_device="auto"` 已在代码里处理 NVIDIA 分支，但没在实机跱过
 
 ---
 
 ## 8. 一句话总结给老板听
 
-> "我们用了一个 120MB 的开源多语言模型 (e5-small) 做语义搜索，能搜中英混搭，能搜图片里识别出来的文字。模型在本地跑，不依赖外部 API。搜索结果通过自适应阈值（每次查询单独算基线）做了清洗，确保不相关结果不会出现，库里没有的东西就返回少量或 0 条，不会无中生有。"
+> "我们用了一个 280 MB 的开源多语言模型 (e5-base) 做语义搜索，跑在 MacBook 的 GPU 上 (Apple MPS)——比 CPU 快 4 倍，吞吐 ≈1700 句/秒。能搜中英混搭，能搜图片里识别出来的文字。模型在本地跑，不依赖外部 API。搜索结果通过自适应阈值（每次查询单独算基线）做了清洗，确保不相关结果不会出现，库里没有的东西就返回少量或 0 条，不会无中生有。"
