@@ -101,6 +101,13 @@ export interface FreshnessRefreshResponse {
   pois: POI[];
 }
 
+export interface InboxClusterTag {
+  cluster_id: string;
+  score: number;
+  is_primary: boolean;
+  source?: string;
+}
+
 export interface InboxItem {
   note_id: string;
   url: string;
@@ -113,6 +120,7 @@ export interface InboxItem {
   cluster_id: string | null;
   raw_meta: Record<string, unknown>;
   last_error: string | null;
+  tags?: InboxClusterTag[];
 }
 
 export interface InboxCluster {
@@ -142,6 +150,7 @@ export interface InboxClusterRunResult {
   duration_s: number;
   low_confidence?: number;
   em_moves?: number;
+  multi_tagged?: number;
 }
 
 export interface InboxPromoteOutcome {
@@ -227,6 +236,6 @@ export const api = {
       early_stopped?: boolean;
       incremental?: boolean;
       by_status: Record<string, number>;
-      auto_cluster?: { assigned: number; unclustered: number; reason?: string };
+      auto_cluster?: { assigned: number; unclustered: number; multi_tagged?: number; reason?: string };
     }>('/api/inbox/scan', body ?? {}),
 };

@@ -131,6 +131,22 @@ CREATE TABLE IF NOT EXISTS inbox_clusters (
   latest_saved_at        TEXT,
   notes_added_last_7d    INTEGER
 );
+
+-- Multi-label inbox tags: a single note can belong to up to N clusters
+-- (top-K nearest centroids by cosine). The note_inbox.cluster_id column is
+-- kept for back-compat and always equals the row with is_primary=1.
+CREATE TABLE IF NOT EXISTS note_cluster_tags (
+  note_id    TEXT NOT NULL,
+  cluster_id TEXT NOT NULL,
+  score      REAL NOT NULL,
+  is_primary INTEGER NOT NULL DEFAULT 0,
+  source     TEXT NOT NULL DEFAULT 'auto',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (note_id, cluster_id),
+  FOREIGN KEY (note_id) REFERENCES note_inbox(note_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_nct_cluster ON note_cluster_tags(cluster_id);
+CREATE INDEX IF NOT EXISTS idx_nct_note ON note_cluster_tags(note_id);
 """
 
 
@@ -720,6 +736,13 @@ class SqliteStore(KnowledgeStore):
                 f"UPDATE note_inbox SET cluster_id=? WHERE note_id IN ({placeholders})",
                 [cluster_id, *note_ids],
             )
+            # Clearing the primary cluster also clears multi-tag rows; the
+            # tag table is meaningless without a primary anchor.
+            if cluster_id is None:
+                c.execute(
+                    f"DELETE FROM note_cluster_tags WHERE note_id IN ({placeholders})",
+                    list(note_ids),
+                )
             return c.total_changes
 
     def inbox_status_counts(self) -> dict[str, int]:
@@ -771,6 +794,18 @@ class SqliteStore(KnowledgeStore):
                         cl.get("notes_added_last_7d"),
                     ),
                 )
+            # Drop multi-tag rows pointing at clusters that no longer exist
+            # (renamed/removed during this re-cluster). Same transaction so
+            # we never leave dangling tags visible to readers.
+            valid_ids = [cl["id"] for cl in clusters]
+            if valid_ids:
+                placeholders = ",".join("?" * len(valid_ids))
+                c.execute(
+                    f"DELETE FROM note_cluster_tags WHERE cluster_id NOT IN ({placeholders})",
+                    valid_ids,
+                )
+            else:
+                c.execute("DELETE FROM note_cluster_tags")
 
     def upsert_cluster(self, cluster: dict[str, Any]) -> None:
         """Insert or update a single cluster row without wiping the table.
@@ -822,4 +857,107 @@ class SqliteStore(KnowledgeStore):
                 "SELECT * FROM inbox_clusters ORDER BY count DESC, name"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---------- multi-label cluster tags ----------
+
+    def set_note_tags(
+        self,
+        note_id: str,
+        tags: list[tuple[str, float]],
+        *,
+        source: str = "auto",
+    ) -> None:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            c.execute("DELETE FROM note_cluster_tags WHERE note_id = ?", (note_id,))
+            if not tags:
+                c.execute(
+                    "UPDATE note_inbox SET cluster_id = NULL WHERE note_id = ?",
+                    (note_id,),
+                )
+                return
+            primary_cid = tags[0][0]
+            for i, (cid, score) in enumerate(tags):
+                c.execute(
+                    """INSERT INTO note_cluster_tags
+                         (note_id, cluster_id, score, is_primary, source, created_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (note_id, cid, float(score), 1 if i == 0 else 0, source, now),
+                )
+            c.execute(
+                "UPDATE note_inbox SET cluster_id = ? WHERE note_id = ?",
+                (primary_cid, note_id),
+            )
+
+    def get_note_tags(self, note_id: str) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT cluster_id, score, is_primary, source
+                   FROM note_cluster_tags WHERE note_id = ?
+                   ORDER BY score DESC""",
+                (note_id,),
+            ).fetchall()
+            return [
+                {
+                    "cluster_id": r["cluster_id"],
+                    "score": r["score"],
+                    "is_primary": bool(r["is_primary"]),
+                    "source": r["source"],
+                }
+                for r in rows
+            ]
+
+    def get_note_tags_bulk(
+        self, note_ids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not note_ids:
+            return {}
+        out: dict[str, list[dict[str, Any]]] = {nid: [] for nid in note_ids}
+        with self._conn() as c:
+            placeholders = ",".join("?" * len(note_ids))
+            rows = c.execute(
+                f"""SELECT note_id, cluster_id, score, is_primary, source
+                    FROM note_cluster_tags
+                    WHERE note_id IN ({placeholders})
+                    ORDER BY score DESC""",
+                list(note_ids),
+            ).fetchall()
+            for r in rows:
+                out.setdefault(r["note_id"], []).append({
+                    "cluster_id": r["cluster_id"],
+                    "score": r["score"],
+                    "is_primary": bool(r["is_primary"]),
+                    "source": r["source"],
+                })
+        return out
+
+    def list_inbox_by_cluster_any(
+        self,
+        cluster_id: str,
+        *,
+        status: str | list[str] | None = "pending",
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        where: list[str] = ["t.cluster_id = ?"]
+        params: list[Any] = [cluster_id]
+        if status:
+            if isinstance(status, str):
+                where.append("ni.status = ?")
+                params.append(status)
+            else:
+                where.append(f"ni.status IN ({','.join('?' * len(status))})")
+                params.extend(status)
+        sql = (
+            "SELECT ni.* FROM note_inbox ni "
+            "JOIN note_cluster_tags t ON t.note_id = ni.note_id "
+            "WHERE " + " AND ".join(where) + " "
+            "ORDER BY (ni.saved_at IS NULL), ni.saved_at DESC, ni.discovered_at DESC "
+            "LIMIT ? OFFSET ?"
+        )
+        params.extend([limit, offset])
+        with self._conn() as c:
+            rows = c.execute(sql, params).fetchall()
+            return [self._inbox_row_to_dict(r) for r in rows]
 

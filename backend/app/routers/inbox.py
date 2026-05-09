@@ -33,15 +33,39 @@ def list_inbox(
     offset: int = Query(0, ge=0),
     store: SqliteStore = Depends(get_store),
 ) -> dict[str, Any]:
-    items = store.list_inbox(
-        status=status,
-        cluster_id=cluster_id,
-        saved_after=saved_after,
-        saved_before=saved_before,
-        title_query=title_query,
-        limit=limit,
-        offset=offset,
-    )
+    # Explicit cluster filter (not __none__) goes through the multi-tag join
+    # so a note tagged with multiple clusters appears under each of them.
+    if cluster_id and cluster_id != "__none__":
+        items = store.list_inbox_by_cluster_any(
+            cluster_id,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        # Apply remaining filters in-memory (saved_at / title_query). These
+        # are rarely combined with cluster filtering and the result set is
+        # already capped by limit; trade-off favours code simplicity.
+        if saved_after:
+            items = [it for it in items if (it.get("saved_at") or "") >= saved_after]
+        if saved_before:
+            items = [it for it in items if (it.get("saved_at") or "") <= saved_before]
+        if title_query:
+            q = title_query.lower()
+            items = [it for it in items if q in (it.get("title") or "").lower()]
+    else:
+        items = store.list_inbox(
+            status=status,
+            cluster_id=cluster_id,
+            saved_after=saved_after,
+            saved_before=saved_before,
+            title_query=title_query,
+            limit=limit,
+            offset=offset,
+        )
+    if items:
+        tags_by_id = store.get_note_tags_bulk([it["note_id"] for it in items])
+        for it in items:
+            it["tags"] = tags_by_id.get(it["note_id"], [])
     return {"items": items, "limit": limit, "offset": offset}
 
 
@@ -93,6 +117,7 @@ def run_clustering(
         "duration_s": round(res.duration_s, 2),
         "low_confidence": res.low_confidence,
         "em_moves": res.em_moves,
+        "multi_tagged": res.multi_tagged,
     }
 
 

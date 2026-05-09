@@ -90,7 +90,7 @@ export default function InboxPage() {
     updated: number;
     early_stopped?: boolean;
     incremental?: boolean;
-    auto_cluster?: { assigned: number; unclustered: number; reason?: string };
+    auto_cluster?: { assigned: number; unclustered: number; multi_tagged?: number; reason?: string };
   } | null>(null);
 
   // Initial + after-discard stats refresh
@@ -535,6 +535,9 @@ export default function InboxPage() {
                   ? ` · 自动归类 ${lastScan.auto_cluster.assigned}` +
                     (lastScan.auto_cluster.unclustered > 0
                       ? ` · ${lastScan.auto_cluster.unclustered} 条未聚类`
+                      : '') +
+                    (lastScan.auto_cluster.multi_tagged && lastScan.auto_cluster.multi_tagged > 0
+                      ? ` · ${lastScan.auto_cluster.multi_tagged} 条多标签`
                       : '')
                   : ''}
               </span>
@@ -610,6 +613,7 @@ export default function InboxPage() {
                         item={it}
                         selected={selected.has(it.note_id)}
                         onToggle={() => toggle(it.note_id)}
+                        clusters={allClusters}
                       />
                     </motion.div>
                   ))}
@@ -858,15 +862,23 @@ function InboxCard({
   item,
   selected,
   onToggle,
+  clusters,
 }: {
   item: InboxItem;
   selected: boolean;
   onToggle: () => void;
+  clusters: InboxCluster[];
 }) {
   const router = useRouter();
   const tone = STATUS_TONE[item.status];
   const label = STATUS_LABEL[item.status];
   const isPromoted = item.status === 'promoted';
+  const tags = (item.tags ?? []).filter(
+    (t) => t.cluster_id !== '__unclustered__' && t.cluster_id !== '__low_conf__',
+  );
+  const showTagChips = tags.length > 1;
+  const clusterName = (cid: string) =>
+    clusters.find((c) => c.id === cid)?.name ?? cid;
   return (
     <Card
       className={cn(
@@ -916,6 +928,24 @@ function InboxCard({
         >
           {item.title || <span className="text-ink-400">（无标题）</span>}
         </div>
+        {showTagChips && (
+          <div className="flex flex-wrap gap-1 mt-0.5">
+            {tags.map((t) => (
+              <span
+                key={t.cluster_id}
+                title={`${clusterName(t.cluster_id)} · ${t.score.toFixed(2)}`}
+                className={cn(
+                  'inline-flex items-center rounded-full px-1.5 leading-tight',
+                  t.is_primary
+                    ? 'bg-rouge-100 text-rouge-700 text-[10px] py-0.5 font-medium'
+                    : 'bg-ink-100 text-ink-500 text-[9.5px] py-[1px]',
+                )}
+              >
+                {clusterName(t.cluster_id)}
+              </span>
+            ))}
+          </div>
+        )}
         <div className="flex items-center justify-between gap-2 mt-auto pt-1">
           <div className="text-[11px] text-ink-400 line-clamp-1 flex-1 min-w-0">
             {item.author || '匿名'}

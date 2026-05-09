@@ -61,6 +61,7 @@ class ClusterRunResult:
     duration_s: float
     low_confidence: int = 0  # titles routed to __low_conf__ catch-all
     em_moves: int = 0        # titles that changed cluster during EM refinement
+    multi_tagged: int = 0    # notes that got >=2 tags
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -216,20 +217,43 @@ def cluster_inbox(
 
     # ---- Phase 3: Low-confidence threshold -> catch-all cluster ----
     LOW_CONF_ID = "__low_conf__"
-    assignments: dict[str, list[str]] = {c["id"]: [] for c in proposed}
-    assignments[LOW_CONF_ID] = []
+    # Track membership for cluster-row count aggregation only; actual
+    # per-note assignment happens via set_note_tags below.
+    membership: dict[str, list[str]] = {c["id"]: [] for c in proposed}
+    membership[LOW_CONF_ID] = []
     low_confidence = 0
-    for nid, (idx, score, _vec) in per_note.items():
+    multi_tagged = 0
+    note_tag_lists: list[tuple[str, list[tuple[str, float]]]] = []  # written after replace_clusters
+    for nid, (idx, score, vec) in per_note.items():
         if score < min_similarity:
-            assignments[LOW_CONF_ID].append(nid)
+            membership[LOW_CONF_ID].append(nid)
             low_confidence += 1
-        else:
-            assignments[proposed[idx]["id"]].append(nid)
+            note_tag_lists.append((nid, [(LOW_CONF_ID, score)]))
+            continue
+        # Score against all centroids and keep top-K above secondary threshold.
+        scored = [
+            (proposed[i]["id"], _cosine(vec, c)) for i, c in enumerate(centroids)
+        ]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_score = scored[0][1]
+        tags: list[tuple[str, float]] = [scored[0]]
+        for cid, sc in scored[1:]:
+            if len(tags) >= MAX_TAGS_PER_NOTE:
+                break
+            if sc < SECONDARY_MIN_SIMILARITY:
+                break
+            if (top_score - sc) > SECONDARY_MAX_DELTA_FROM_TOP:
+                break
+            tags.append((cid, sc))
+        membership[tags[0][0]].append(nid)
+        if len(tags) >= 2:
+            multi_tagged += 1
+        note_tag_lists.append((nid, tags))
 
     # ---- Persist ----
     cluster_records: list[dict[str, Any]] = []
     for c in proposed:
-        members = assignments.get(c["id"], [])
+        members = membership.get(c["id"], [])
         if members:
             agg = _time_aggregates(store, members)
             cluster_records.append({
@@ -240,7 +264,7 @@ def cluster_inbox(
                 **agg,
             })
     if low_confidence > 0:
-        members = assignments[LOW_CONF_ID]
+        members = membership[LOW_CONF_ID]
         agg = _time_aggregates(store, members)
         cluster_records.append({
             "id": LOW_CONF_ID,
@@ -251,11 +275,15 @@ def cluster_inbox(
         })
     store.replace_clusters(cluster_records)
 
+    # Write multi-tag rows AFTER replace_clusters so the dangling-tag cleanup
+    # in replace_clusters doesn't immediately wipe what we just inserted.
     total_assigned = 0
-    for cid, ids in assignments.items():
-        if ids:
-            store.set_inbox_cluster(ids, cid)
-            total_assigned += len(ids)
+    for nid, tags in note_tag_lists:
+        try:
+            store.set_note_tags(nid, tags)  # type: ignore[attr-defined]
+            total_assigned += 1
+        except Exception:
+            pass
 
     return ClusterRunResult(
         clusters=cluster_records,
@@ -264,6 +292,7 @@ def cluster_inbox(
         duration_s=time.time() - t0,
         low_confidence=low_confidence,
         em_moves=em_moves,
+        multi_tagged=multi_tagged,
     )
 
 
@@ -279,12 +308,26 @@ UNCLUSTERED_ID = "__unclustered__"
 UNCLUSTERED_NAME = "未聚类"
 UNCLUSTERED_DESC = "新增时未能自动归类（聚类服务暂不可用或无现有聚类）。下次「重新聚类」时会被重新分配。"
 
+# Multi-label tagging thresholds.
+MAX_TAGS_PER_NOTE = 2
+PRIMARY_MIN_SIMILARITY = 0.55  # top-1 must clear this to escape __unclustered__
+SECONDARY_MIN_SIMILARITY = 0.48  # absolute floor for secondary tags
+# Secondary tags must also be within this absolute cosine-distance of the
+# top-1 score. e5 embeddings on Chinese short titles cluster very tightly
+# in [0.85, 0.95], so an absolute floor alone is meaningless; the relative
+# margin is what actually keeps off-topic clusters from sneaking in.
+SECONDARY_MAX_DELTA_FROM_TOP = 0.015
+
 
 def _mark_unclustered(store: KnowledgeStore, note_ids: list[str], reason: str) -> dict[str, Any]:
     """Tag every note_id as ``__unclustered__`` and ensure the bucket exists."""
     if not note_ids:
-        return {"assigned": 0, "unclustered": 0, "reason": reason}
-    store.set_inbox_cluster(note_ids, UNCLUSTERED_ID)
+        return {"assigned": 0, "unclustered": 0, "multi_tagged": 0, "reason": reason}
+    for nid in note_ids:
+        try:
+            store.set_note_tags(nid, [(UNCLUSTERED_ID, 0.0)])  # type: ignore[attr-defined]
+        except Exception:
+            store.set_inbox_cluster([nid], UNCLUSTERED_ID)
     try:
         store.upsert_cluster({  # type: ignore[attr-defined]
             "id": UNCLUSTERED_ID,
@@ -293,56 +336,91 @@ def _mark_unclustered(store: KnowledgeStore, note_ids: list[str], reason: str) -
         })
     except Exception:
         pass  # cluster bucket is cosmetic; the note_inbox.cluster_id is what matters
-    return {"assigned": 0, "unclustered": len(note_ids), "reason": reason}
+    return {"assigned": 0, "unclustered": len(note_ids), "multi_tagged": 0, "reason": reason}
+
+
+def build_existing_centroids(
+    store: KnowledgeStore,
+    embed,
+    *,
+    sample_per_cluster: int = 30,
+) -> tuple[list[str], list[list[float]], list[dict[str, Any]]]:
+    """Build a centroid per existing (non-unclustered) cluster.
+
+    Returns ``(cluster_ids, centroids, existing_meta)`` where ``cluster_ids[i]``
+    corresponds to ``centroids[i]``. Empty clusters fall back to embedding the
+    cluster name itself, which keeps the centroid count aligned with metadata.
+    Shared between :func:`assign_to_existing_clusters` and the backfill script.
+    """
+    existing = [c for c in store.list_clusters() if c["id"] != UNCLUSTERED_ID]
+    if not existing:
+        return [], [], []
+
+    cluster_titles: list[tuple[str, list[str]]] = []
+    for c in existing:
+        cid = c["id"]
+        try:
+            members = store.list_inbox(
+                cluster_id=cid, status=None, limit=sample_per_cluster
+            )
+        except Exception:
+            members = []
+        titles = [m.get("title") or "" for m in members if (m.get("title") or "").strip()]
+        if not titles:
+            titles = [c.get("name") or cid]
+        cluster_titles.append((cid, titles))
+
+    flat: list[str] = []
+    spans: list[tuple[int, int]] = []
+    for _cid, titles in cluster_titles:
+        start = len(flat)
+        flat.extend(titles)
+        spans.append((start, len(flat)))
+    all_vecs = embed.embed(flat) if flat else []
+
+    valid_ids: list[str] = []
+    centroids: list[list[float]] = []
+    for (cid, _t), (s, e) in zip(cluster_titles, spans):
+        if e > s:
+            valid_ids.append(cid)
+            centroids.append(_centroid(all_vecs[s:e]))
+    return valid_ids, centroids, existing
 
 
 def assign_to_existing_clusters(
     store: KnowledgeStore,
     new_note_ids: list[str],
     *,
-    min_similarity: float = 0.55,
+    min_similarity: float = PRIMARY_MIN_SIMILARITY,
     sample_per_cluster: int = 30,
 ) -> dict[str, Any]:
-    """Classify *new* inbox notes into the nearest existing cluster.
+    """Classify *new* inbox notes into the nearest existing cluster(s).
 
     Designed for the post-scan path: cheap (no LLM), embedding-only, and
     never throws — anything that goes wrong (no provider, no clusters,
     embedding error) results in the notes being tagged ``__unclustered__``
     so a future full re-cluster can sweep them up.
 
-    Returns ``{assigned, unclustered, reason?, by_cluster?}``.
+    Returns ``{assigned, unclustered, multi_tagged, reason?, by_cluster?}``
+    where ``multi_tagged`` is the count of notes that received >=2 tags.
     """
     if not new_note_ids:
-        return {"assigned": 0, "unclustered": 0}
+        return {"assigned": 0, "unclustered": 0, "multi_tagged": 0}
 
-    # 1) Existing clusters?
-    try:
-        existing = [c for c in store.list_clusters() if c["id"] != UNCLUSTERED_ID]
-    except Exception as e:
-        return _mark_unclustered(store, new_note_ids, f"list_clusters failed: {e}")
-    if not existing:
-        return _mark_unclustered(store, new_note_ids, "no existing clusters yet")
-
-    # 2) Pull each cluster's member titles to rebuild a centroid.
     try:
         embed = get_embedding_provider()
     except Exception as e:
         return _mark_unclustered(store, new_note_ids, f"no embedding provider: {e}")
 
-    cluster_titles: list[tuple[str, list[str]]] = []  # (cluster_id, titles[])
-    for c in existing:
-        cid = c["id"]
-        try:
-            members = store.list_inbox(cluster_id=cid, status=None, limit=sample_per_cluster)
-        except Exception:
-            members = []
-        titles = [m.get("title") or "" for m in members if (m.get("title") or "").strip()]
-        if not titles:
-            # fall back to the cluster name itself so it still gets a centroid
-            titles = [c.get("name") or cid]
-        cluster_titles.append((cid, titles))
+    try:
+        valid_cluster_ids, centroids, existing = build_existing_centroids(
+            store, embed, sample_per_cluster=sample_per_cluster,
+        )
+    except Exception as e:
+        return _mark_unclustered(store, new_note_ids, f"centroid build failed: {e}")
+    if not centroids:
+        return _mark_unclustered(store, new_note_ids, "no existing clusters yet")
 
-    # 3) Pull new note titles in one go.
     try:
         new_rows = [store.get_inbox(nid) for nid in new_note_ids]
     except Exception as e:
@@ -350,72 +428,73 @@ def assign_to_existing_clusters(
     new_pairs = [(r["note_id"], (r.get("title") or "").strip()) for r in new_rows if r]
     new_pairs = [(nid, t) for nid, t in new_pairs if t]
     if not new_pairs:
-        # No usable titles → leave them where they are (likely already pending/no cluster).
-        return {"assigned": 0, "unclustered": 0, "reason": "no titles to embed"}
+        return {"assigned": 0, "unclustered": 0, "multi_tagged": 0,
+                "reason": "no titles to embed"}
 
-    # 4) Batch-embed centroid sources + new titles.
     try:
-        flat: list[str] = []
-        spans: list[tuple[int, int]] = []
-        for _cid, titles in cluster_titles:
-            start = len(flat)
-            flat.extend(titles)
-            spans.append((start, len(flat)))
-        new_start = len(flat)
-        flat.extend(t for _nid, t in new_pairs)
-        all_vecs = embed.embed(flat) if flat else []
-        centroids = [_centroid(all_vecs[s:e]) for s, e in spans if e > s]
-        valid_cluster_ids = [cid for (cid, _t), (s, e) in zip(cluster_titles, spans) if e > s]
-        new_vecs = all_vecs[new_start:]
+        new_vecs = embed.embed([t for _nid, t in new_pairs])
     except Exception as e:
-        return _mark_unclustered(store, [nid for nid, _ in new_pairs], f"embedding failed: {e}")
+        return _mark_unclustered(
+            store, [nid for nid, _ in new_pairs], f"embedding failed: {e}",
+        )
 
-    if not centroids:
-        return _mark_unclustered(store, [nid for nid, _ in new_pairs], "no usable centroids")
-
-    # 5) Nearest-centroid assignment with confidence threshold.
     by_cluster: dict[str, list[str]] = {}
     unclustered_ids: list[str] = []
+    multi_tagged = 0
+    assigned = 0
     for (nid, _title), vec in zip(new_pairs, new_vecs):
         if not vec:
             unclustered_ids.append(nid)
             continue
-        best_idx, best_score = -1, -2.0
-        for idx, centroid in enumerate(centroids):
-            score = _cosine(vec, centroid)
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-        if best_idx < 0 or best_score < min_similarity:
+        scored = [
+            (valid_cluster_ids[idx], _cosine(vec, centroid))
+            for idx, centroid in enumerate(centroids)
+        ]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        if not scored or scored[0][1] < min_similarity:
             unclustered_ids.append(nid)
-        else:
-            by_cluster.setdefault(valid_cluster_ids[best_idx], []).append(nid)
-
-    # 6) Persist.
-    assigned = 0
-    for cid, ids in by_cluster.items():
+            continue
+        top_score = scored[0][1]
+        tags: list[tuple[str, float]] = [scored[0]]
+        for cid, score in scored[1:]:
+            if len(tags) >= MAX_TAGS_PER_NOTE:
+                break
+            if score < SECONDARY_MIN_SIMILARITY:
+                break
+            if (top_score - score) > SECONDARY_MAX_DELTA_FROM_TOP:
+                break
+            tags.append((cid, score))
         try:
-            store.set_inbox_cluster(ids, cid)
-            assigned += len(ids)
-            # Refresh count on the affected cluster row.
-            existing_meta = next((c for c in existing if c["id"] == cid), None)
-            if existing_meta is not None:
-                try:
-                    store.upsert_cluster({  # type: ignore[attr-defined]
-                        "id": cid,
-                        "name": existing_meta.get("name") or cid,
-                        "description": existing_meta.get("description"),
-                    })
-                except Exception:
-                    pass
+            store.set_note_tags(nid, tags)  # type: ignore[attr-defined]
         except Exception:
-            unclustered_ids.extend(ids)
-            assigned -= 0  # nothing to undo, just route to fallback
+            unclustered_ids.append(nid)
+            continue
+        by_cluster.setdefault(tags[0][0], []).append(nid)
+        assigned += 1
+        if len(tags) >= 2:
+            multi_tagged += 1
+
+    # Refresh count on affected clusters (cosmetic).
+    for cid in by_cluster:
+        meta = next((c for c in existing if c["id"] == cid), None)
+        if meta is not None:
+            try:
+                store.upsert_cluster({  # type: ignore[attr-defined]
+                    "id": cid,
+                    "name": meta.get("name") or cid,
+                    "description": meta.get("description"),
+                })
+            except Exception:
+                pass
 
     if unclustered_ids:
         _mark_unclustered(store, unclustered_ids, "low confidence or assignment error")
 
-    out: dict[str, Any] = {"assigned": assigned, "unclustered": len(unclustered_ids)}
+    out: dict[str, Any] = {
+        "assigned": assigned,
+        "unclustered": len(unclustered_ids),
+        "multi_tagged": multi_tagged,
+    }
     if by_cluster:
         out["by_cluster"] = {cid: len(ids) for cid, ids in by_cluster.items()}
     return out

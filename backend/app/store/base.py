@@ -65,3 +65,30 @@ class KnowledgeStore(ABC):
 
     @abstractmethod
     def list_clusters(self) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    def set_note_tags(
+        self,
+        note_id: str,
+        tags: list[tuple[str, float]],
+        *,
+        source: str = "auto",
+    ) -> None: ...
+
+    @abstractmethod
+    def get_note_tags(self, note_id: str) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    def get_note_tags_bulk(
+        self, note_ids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]: ...
+
+    @abstractmethod
+    def list_inbox_by_cluster_any(
+        self,
+        cluster_id: str,
+        *,
+        status=None,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]: ...

@@ -100,6 +100,13 @@ def test_cluster_inbox_assigns_every_title_to_some_cluster(tmp_path):
     rows = store.list_inbox(status="pending", limit=100)
     assert all(r.get("cluster_id") for r in rows), "some inbox rows missing cluster_id"
 
+    # Multi-tag rows must be written and primary_id must mirror cluster_id.
+    tags_by_id = store.get_note_tags_bulk([r["note_id"] for r in rows])
+    assert all(tags_by_id.get(r["note_id"]) for r in rows), "missing tag rows"
+    for r in rows:
+        primary = next(t for t in tags_by_id[r["note_id"]] if t["is_primary"])
+        assert primary["cluster_id"] == r["cluster_id"]
+
 
 def test_cluster_inbox_handles_empty_inbox(tmp_path):
     _reset_provider_singletons()
