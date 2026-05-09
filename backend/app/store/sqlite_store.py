@@ -85,6 +85,13 @@ CREATE INDEX IF NOT EXISTS idx_chunks_note ON note_chunks(note_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS note_chunks_fts USING fts5(
   text, chunk_id UNINDEXED, note_id UNINDEXED, tokenize='unicode61'
 );
+
+CREATE TABLE IF NOT EXISTS city_workbench_cache (
+  city          TEXT PRIMARY KEY,
+  payload       TEXT NOT NULL,
+  notes_signature TEXT,
+  created_at    TEXT NOT NULL
+);
 """
 
 
@@ -319,6 +326,27 @@ class SqliteStore(KnowledgeStore):
                 d["aliases"] = json.loads(d.get("aliases") or "[]")
                 pois.append(d)
             return {"notes": notes, "pois": pois}
+
+    def get_cached_clusters(self, city: str, signature: str) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT payload, notes_signature FROM city_workbench_cache WHERE city = ?",
+                (city,),
+            ).fetchone()
+            if not row or row["notes_signature"] != signature:
+                return None
+            try:
+                return json.loads(row["payload"])
+            except Exception:
+                return None
+
+    def save_cached_clusters(self, city: str, signature: str, payload: dict[str, Any]) -> None:
+        from datetime import datetime, timezone
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO city_workbench_cache (city, payload, notes_signature, created_at) VALUES (?, ?, ?, ?)",
+                (city, json.dumps(payload, ensure_ascii=False), signature, datetime.now(timezone.utc).isoformat()),
+            )
 
     def get_note(self, note_id: str) -> dict[str, Any] | None:
         with self._conn() as c:

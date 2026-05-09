@@ -64,6 +64,20 @@ export interface WorkbenchData {
   notes: Note[];
   pois: POI[];
   categories: CategoryGroup[];
+  clusters?: WorkbenchClusters;
+}
+
+export interface ClusterItem {
+  label: string;
+  reason: string;
+  note_ids: string[];
+}
+
+export interface WorkbenchClusters {
+  hot: ClusterItem[];
+  cold: ClusterItem[];
+  dish_radar: ClusterItem[];
+  blind_spots: ClusterItem[];
 }
 
 export interface SearchHit {

@@ -18,6 +18,13 @@ class LLMProvider(ABC):
     def explain_search(self, query: str, hits: list[dict[str, Any]]) -> str:
         """Short natural-language explanation summarising results."""
 
+    @abstractmethod
+    def cluster_city(self, city: str, notes: list[dict[str, Any]]) -> dict[str, Any]:
+        """Cluster a city's notes into actionable insights.
+        Returns {"hot":[Cluster], "cold":[Cluster], "dish_radar":[Cluster], "blind_spots":[Cluster]}
+        Cluster = {label:str, reason:str, note_ids:[str]}
+        """
+
 
 _CITY_HINTS = {
     "京都": ("京都", "JP"), "Kyoto": ("京都", "JP"),
@@ -101,6 +108,43 @@ class MockLLMProvider(LLMProvider):
         coverage = f"，覆盖 {', '.join(cities)}" if cities else ""
         return f"为「{query}」找到 {len(hits)} 条相关收藏{coverage}。"
 
+    def cluster_city(self, city: str, notes: list[dict[str, Any]]) -> dict[str, Any]:
+        """Heuristic baseline: hot=most-purposes notes, cold=oldest, dish_radar=food, blind_spots=closed POIs."""
+        hot, cold, dish, blind = [], [], [], []
+        food_notes = [n for n in notes if "food" in (n.get("trip_purpose") or [])]
+        if food_notes:
+            dish.append({
+                "label": f"{city} 美食地图",
+                "reason": f"按收藏频次推荐，共 {len(food_notes)} 家",
+                "note_ids": [n["id"] for n in food_notes[:6]],
+            })
+        # hot = first 3 by saved_at desc (notes already sorted)
+        if notes:
+            hot.append({
+                "label": "近期收藏热点",
+                "reason": "最近收藏的 3 条",
+                "note_ids": [n["id"] for n in notes[:3]],
+            })
+        # cold = bottom 3
+        if len(notes) > 3:
+            cold.append({
+                "label": "沉睡收藏",
+                "reason": "很久没看的收藏，出发前可以重温",
+                "note_ids": [n["id"] for n in notes[-3:]],
+            })
+        # blind = notes whose pois have closed status
+        closed_notes = [
+            n["id"] for n in notes
+            if any((p.get("poi") or {}).get("freshness_status") == "closed" for p in (n.get("pois") or []))
+        ]
+        if closed_notes:
+            blind.append({
+                "label": "可能塌房",
+                "reason": "POI 鲜活度检查显示已关闭/搬迁",
+                "note_ids": closed_notes,
+            })
+        return {"hot": hot, "cold": cold, "dish_radar": dish, "blind_spots": blind}
+
 
 class QwenLLMProvider(LLMProvider):
     def __init__(self, api_key: str):
@@ -134,6 +178,9 @@ class QwenLLMProvider(LLMProvider):
 
     def explain_search(self, query: str, hits: list[dict[str, Any]]) -> str:
         return MockLLMProvider().explain_search(query, hits)
+
+    def cluster_city(self, city: str, notes: list[dict[str, Any]]) -> dict[str, Any]:
+        return MockLLMProvider().cluster_city(city, notes)
 
 
 _EXTRACT_PROMPT = (
@@ -234,6 +281,75 @@ class AzureOpenAILLMProvider(LLMProvider):
             ).strip()
         except Exception:
             return MockLLMProvider().explain_search(query, hits)
+
+    def cluster_city(self, city: str, notes: list[dict[str, Any]]) -> dict[str, Any]:
+        if not notes:
+            return {"hot": [], "cold": [], "dish_radar": [], "blind_spots": []}
+        # Build a compact digest the LLM can reason about.
+        digest_lines: list[str] = []
+        for n in notes:
+            poi_names = [
+                (p.get("poi") or {}).get("canonical_name", "")
+                for p in (n.get("pois") or [])
+            ]
+            poi_status = [
+                (p.get("poi") or {}).get("freshness_status") or "?"
+                for p in (n.get("pois") or [])
+            ]
+            digest_lines.append(
+                f"- id={n['id']} | {n.get('title','')[:50]} | "
+                f"purpose={','.join(n.get('trip_purpose') or [])} | "
+                f"saved={n.get('saved_at','')[:10]} | "
+                f"pois={'/'.join(filter(None, poi_names)) or '-'} "
+                f"({'/'.join(poi_status) or '-'}) | "
+                f"summary={n.get('ai_summary','')[:60]}"
+            )
+        digest = "\n".join(digest_lines)
+        prompt = (
+            f"以下是用户在「{city}」收藏的小红书笔记摘要：\n"
+            f"{digest}\n\n"
+            "请把这些笔记按 4 个维度聚类，输出严格 JSON：\n"
+            "{\n"
+            '  "hot":         [{"label":"小标题(8字内)","reason":"为什么聚一起(20字内)","note_ids":["id1","id2"]}],  # 最值得优先去的 1-3 簇\n'
+            '  "cold":        [{"label":"...","reason":"...","note_ids":[...]}],  # 沉睡很久或冷门但有价值的 0-2 簇\n'
+            '  "dish_radar":  [{"label":"...","reason":"...","note_ids":[...]}],  # 美食按品类/价位聚 1-3 簇\n'
+            '  "blind_spots": [{"label":"...","reason":"...","note_ids":[...]}]   # 已塌房/可能塌房/缺口 0-2 簇\n'
+            "}\n"
+            "注意：1) note_ids 必须是上面出现过的 id，至少 1 个；"
+            "2) 每个维度可以为空数组；3) label/reason 都用中文；"
+            "4) 一个 note 可以出现在多个簇里。"
+        )
+        try:
+            content = self._chat(
+                [
+                    {"role": "system", "content": "你是个人收藏分析师，擅长把杂乱笔记聚成可执行的洞察。只输出 JSON。"},
+                    {"role": "user", "content": prompt},
+                ],
+                json_mode=True,
+                max_tokens=1200,
+                temperature=0.4,
+            )
+            data = _parse_json_lenient(content) or {}
+            note_ids = {n["id"] for n in notes}
+            out: dict[str, list[dict[str, Any]]] = {"hot": [], "cold": [], "dish_radar": [], "blind_spots": []}
+            for k in out:
+                for c in data.get(k) or []:
+                    if not isinstance(c, dict):
+                        continue
+                    ids = [i for i in (c.get("note_ids") or []) if i in note_ids]
+                    if not ids:
+                        continue
+                    out[k].append({
+                        "label": (c.get("label") or "")[:40],
+                        "reason": (c.get("reason") or "")[:80],
+                        "note_ids": ids,
+                    })
+            # If LLM produced nothing useful, fall back to heuristic.
+            if not any(out.values()):
+                return MockLLMProvider().cluster_city(city, notes)
+            return out
+        except Exception:
+            return MockLLMProvider().cluster_city(city, notes)
 
 
 def _parse_json_lenient(text: str) -> dict[str, Any] | None:

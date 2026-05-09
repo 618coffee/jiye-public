@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from ..providers.llm import get_llm_provider
 from ..services.freshness import refresh_city as do_refresh
 from ..services.ingest import country_flag
 from ..store.sqlite_store import SqliteStore
@@ -56,6 +60,25 @@ def workbench(city: str, store: SqliteStore = Depends(get_store)) -> dict:
         for k, label, icon in cat_defs
     ]
     country = wb["notes"][0].get("primary_country", "CN")
+
+    # ---- LLM clustering with DB cache (TTL by content signature) ----
+    sig_src = json.dumps(
+        sorted(
+            (n["id"], (n.get("ai_summary") or "")[:40],
+             tuple(sorted(n.get("trip_purpose") or [])),
+             tuple(sorted(((p.get("poi") or {}).get("freshness_status") or "")
+                          for p in (n.get("pois") or []))))
+            for n in wb["notes"]
+        ),
+        ensure_ascii=False,
+    )
+    signature = hashlib.sha1(sig_src.encode()).hexdigest()
+    clusters = store.get_cached_clusters(city, signature)
+    if clusters is None:
+        llm = get_llm_provider()
+        clusters = llm.cluster_city(city, wb["notes"])
+        store.save_cached_clusters(city, signature, clusters)
+
     return {
         "city": city,
         "country": country,
@@ -63,6 +86,7 @@ def workbench(city: str, store: SqliteStore = Depends(get_store)) -> dict:
         "notes": wb["notes"],
         "pois": wb["pois"],
         "categories": categories,
+        "clusters": clusters,
     }
 
 

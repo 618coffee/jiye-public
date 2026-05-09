@@ -11,6 +11,7 @@ import { Badge } from '@/components/ui/Badge';
 import { CategoryTabs } from './CategoryTabs';
 import { NoteCard } from './NoteCard';
 import { POIRail } from './POIRail';
+import { ClusterRail } from './ClusterRail';
 
 interface Props {
   data: WorkbenchData;
@@ -92,6 +93,9 @@ export function Workbench({ data }: Props) {
 
       {/* POI rail (with freshness badges) */}
       {pois.length > 0 && <POIRail pois={pois} />}
+
+      {/* AI clusters */}
+      {data.clusters && <ClusterRail clusters={data.clusters} notes={data.notes} />}
 
       {/* Notes grid */}
       <section>
