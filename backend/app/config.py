@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     # Batch size used when encoding many chunks at once. MPS/CUDA win at ≥32;
     # CPU sweet spot is ~16-32. Larger uses more memory but is faster.
     embedding_batch_size: int = 64
+
+    # XHS crawler defaults — can be overridden by env or per-call args.
+    xhs_cdp_endpoint: str = "http://127.0.0.1:9222"
+    xhs_collection_url: str = ""    # e.g. https://www.xiaohongshu.com/user/profile/<uid>?tab=fav&subTab=note
+
     @property
     def has_azure_openai(self) -> bool:
         return bool(self.azure_openai_endpoint and self.azure_openai_api_key)

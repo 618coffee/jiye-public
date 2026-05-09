@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import {
   Inbox as InboxIcon,
   RefreshCw,
+  DownloadCloud,
   Trash2,
   ExternalLink,
   Search,
@@ -82,6 +83,12 @@ export default function InboxPage() {
   const [promoting, setPromoting] = useState(false);
   const [promoteProgress, setPromoteProgress] = useState<{ done: number; total: number } | null>(null);
   const [lastPromote, setLastPromote] = useState<InboxPromoteResult | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [lastScan, setLastScan] = useState<{
+    scanned: number;
+    inserted: number;
+    updated: number;
+  } | null>(null);
 
   // Initial + after-discard stats refresh
   async function loadStats() {
@@ -221,6 +228,32 @@ export default function InboxPage() {
     }
   }
 
+  async function runScan() {
+    if (scanning) return;
+    if (!confirm(
+      '确认开始扫描小红书收藏夹？\n\n' +
+      '需要在本机已用 --remote-debugging-port=9222 启动并登录小红书的 Chrome。' +
+      '抓取 1000+ 条标题大约 1-2 分钟，期间请勿关闭那个 Chrome 标签页。'
+    )) return;
+    setScanning(true);
+    setError(null);
+    setLastScan(null);
+    try {
+      const r = await api.inboxScan();
+      setLastScan({ scanned: r.scanned, inserted: r.inserted, updated: r.updated });
+      await loadStats();
+      startTransition(() => {
+        void loadItems(0, false);
+        setOffset(0);
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : '扫描失败';
+      setError(msg);
+    } finally {
+      setScanning(false);
+    }
+  }
+
   async function runRecluster(target: number, sample: number, threshold: number, em: number) {
     setReclusterRunning(true);
     setError(null);
@@ -289,6 +322,15 @@ export default function InboxPage() {
               )}
             </p>
           </div>
+          <Button
+            variant="soft"
+            size="md"
+            onClick={runScan}
+            disabled={scanning}
+          >
+            {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <DownloadCloud className="w-4 h-4" />}
+            {scanning ? '扫描中…' : '扫描收藏夹'}
+          </Button>
           <Button
             variant="soft"
             size="md"
@@ -464,6 +506,23 @@ export default function InboxPage() {
           {error && (
             <Card className="p-4 border-rose-200 bg-rose-50/80 text-rose-700 text-sm">
               {error}
+            </Card>
+          )}
+
+          {/* Scan result banner */}
+          {lastScan && (
+            <Card className="p-3 border-sky-200 bg-sky-50/80 text-sm flex items-center gap-2 text-sky-800">
+              <DownloadCloud className="w-4 h-4" />
+              <span>
+                扫描完成：共 {lastScan.scanned} 条 · 新增 {lastScan.inserted} · 更新 {lastScan.updated}
+              </span>
+              <button
+                onClick={() => setLastScan(null)}
+                className="ml-auto p-1 rounded hover:bg-sky-100 text-sky-700"
+                aria-label="关闭"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
             </Card>
           )}
 

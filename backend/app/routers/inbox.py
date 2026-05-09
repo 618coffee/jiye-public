@@ -5,6 +5,8 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 
+from ..config import settings
+from ..crawler.xhs import CrawlerConfig, CrawlerError, XhsCollectionCrawler
 from ..services.inbox_clustering import cluster_inbox
 from ..services.inbox_promote import (
     DEFAULT_MAX_PER_REQUEST,
@@ -151,4 +153,77 @@ def promote(
         "failed": res.failed,
         "skipped": res.skipped,
         "duration_s": round(res.duration_s, 2),
+    }
+
+
+@router.post("/scan")
+async def scan_collection(
+    payload: dict[str, Any] = Body(default_factory=dict),
+    store: SqliteStore = Depends(get_store),
+) -> dict[str, Any]:
+    """Drive the xhs collection crawler and upsert into note_inbox.
+
+    Body (all optional):
+      - url:          override the collection page URL (defaults to settings.xhs_collection_url)
+      - cdp:          override the CDP endpoint (defaults to settings.xhs_cdp_endpoint)
+      - idle:         max idle scrolls (default 4)
+      - pause:        scroll pause seconds (default 1.4)
+      - max_scrolls:  scroll cap (default 400)
+      - dry_run:      bool — if true, returns counts but doesn't upsert
+
+    Requires a Chrome instance launched with --remote-debugging-port=<cdp>
+    and already logged into xiaohongshu.com. Returns inserted/updated counts.
+    """
+    target_url = (payload.get("url") or settings.xhs_collection_url or "").strip()
+    if not target_url:
+        raise HTTPException(
+            400,
+            "no collection URL configured. Pass body.url or set "
+            "XHS_COLLECTION_URL env var.",
+        )
+    cfg = CrawlerConfig(
+        cdp_endpoint=str(payload.get("cdp") or settings.xhs_cdp_endpoint),
+        max_idle_scrolls=int(payload.get("idle") or 4),
+        scroll_pause_s=float(payload.get("pause") or 1.4),
+        max_scroll_iterations=int(payload.get("max_scrolls") or 400),
+        debug_dom=False,
+    )
+    dry_run = bool(payload.get("dry_run"))
+    crawler = XhsCollectionCrawler(cfg)
+    try:
+        result = await crawler.scan(target_url=target_url)
+    except CrawlerError as e:
+        raise HTTPException(502, f"crawler error: {e}") from e
+
+    if dry_run:
+        return {
+            "scanned": len(result.items),
+            "page_url": result.page_url,
+            "dry_run": True,
+        }
+
+    inbox_payload = [
+        {
+            "note_id": it["note_id"],
+            "url": it["url"],
+            "title": it.get("title"),
+            "cover_url": it.get("cover_url"),
+            "author": it.get("author"),
+            "saved_at": None,
+            "raw_meta": {
+                "discovered_via": "xhs_collection_crawler",
+                "page_url": result.page_url,
+                "xsec_token": it.get("xsec_token"),
+                "xsec_source": it.get("xsec_source") or "pc_user",
+            },
+        }
+        for it in result.items
+    ]
+    counts = store.upsert_inbox_many(inbox_payload)
+    return {
+        "scanned": len(result.items),
+        "inserted": counts["inserted"],
+        "updated": counts["updated"],
+        "page_url": result.page_url,
+        "by_status": store.inbox_status_counts(),
     }

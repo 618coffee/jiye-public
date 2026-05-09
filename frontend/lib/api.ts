@@ -218,4 +218,12 @@ export const api = {
       max_per_request !== undefined
         ? { note_ids, max_per_request }
         : { note_ids }),
+  inboxScan: (body?: { url?: string; idle?: number; pause?: number; max_scrolls?: number }) =>
+    postJson<{
+      scanned: number;
+      inserted: number;
+      updated: number;
+      page_url: string;
+      by_status: Record<string, number>;
+    }>('/api/inbox/scan', body ?? {}),
 };
