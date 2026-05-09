@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .services.ingest import ingest_note
+from .services.seed_images import url_for as _sample_url
 from .store.base import KnowledgeStore
 
 
@@ -173,8 +174,17 @@ def _sample_notes() -> list[dict[str, Any]]:
         ),
     ]
     notes: list[dict[str, Any]] = []
+    # For 3 representative notes we replace the 1st image with a synthetic
+    # menu/poster image so the OCR pipeline has real text to recognise.
+    OCR_DEMO = {
+        "kyt001": "kyoto-menu.png",
+        "tk001": "tokyo-cafe.png",
+        "la001": "la-venice.png",
+    }
     for i, (nid, title, body, author, img_seeds, _hint) in enumerate(samples):
         images = [_img(s) for s in img_seeds]
+        if nid in OCR_DEMO and images:
+            images[0] = _sample_url(OCR_DEMO[nid])
         cover = images[0] if images else None
         notes.append({
             "id": nid,

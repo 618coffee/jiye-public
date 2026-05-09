@@ -37,6 +37,8 @@ export interface Note {
   trip_purpose: string[];
   ai_summary?: string | null;
   image_index_level: number;
+  image_thumbnails?: (string | null)[];
+  image_ocr_texts?: string[];
   pois: NotePOILink[];
 }
 

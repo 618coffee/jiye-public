@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     # 'auto' = mock when key missing; 'true' = always mock; 'false' = never mock
     use_mock: str = "auto"
 
+    # Image OCR + thumbnail pipeline
+    ocr_enabled: bool = True
+    thumbnail_width: int = 320
+
     @property
     def has_azure_openai(self) -> bool:
         return bool(self.azure_openai_endpoint and self.azure_openai_api_key)

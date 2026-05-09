@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS notes (
   published_at  TEXT,
   saved_at      TEXT,
   image_paths   TEXT,
+  image_thumbnails TEXT,
+  image_ocr_texts TEXT,
   primary_city  TEXT,
   primary_country TEXT,
   city_confidence REAL,
@@ -131,6 +133,11 @@ class SqliteStore(KnowledgeStore):
     def init_schema(self) -> None:
         with self._conn() as c:
             c.executescript(SCHEMA)
+            # Backwards-compatible additive migrations
+            cols = {r[1] for r in c.execute("PRAGMA table_info(notes)").fetchall()}
+            for col in ("image_thumbnails", "image_ocr_texts"):
+                if col not in cols:
+                    c.execute(f"ALTER TABLE notes ADD COLUMN {col} TEXT")
 
     # ---------- writes ----------
 
@@ -139,11 +146,13 @@ class SqliteStore(KnowledgeStore):
             c.execute(
                 """
                 INSERT INTO notes (id, url, title, body, author, cover, published_at,
-                  saved_at, image_paths, primary_city, primary_country, city_confidence,
+                  saved_at, image_paths, image_thumbnails, image_ocr_texts,
+                  primary_city, primary_country, city_confidence,
                   trip_purpose, image_index_level, ai_summary)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                   title=excluded.title, body=excluded.body, ai_summary=excluded.ai_summary,
+                  image_thumbnails=excluded.image_thumbnails, image_ocr_texts=excluded.image_ocr_texts,
                   primary_city=excluded.primary_city, primary_country=excluded.primary_country,
                   trip_purpose=excluded.trip_purpose, image_index_level=excluded.image_index_level
                 """,
@@ -151,6 +160,8 @@ class SqliteStore(KnowledgeStore):
                     note["id"], note.get("url"), note.get("title", ""), note.get("body", ""),
                     note.get("author"), note.get("cover"), note.get("published_at"),
                     note.get("saved_at"), json.dumps(note.get("images", []), ensure_ascii=False),
+                    json.dumps(note.get("image_thumbnails", []), ensure_ascii=False),
+                    json.dumps(note.get("image_ocr_texts", []), ensure_ascii=False),
                     note.get("primary_city"), note.get("primary_country", "CN"),
                     note.get("city_confidence", 1.0),
                     json.dumps(note.get("trip_purpose", []), ensure_ascii=False),
@@ -233,6 +244,8 @@ class SqliteStore(KnowledgeStore):
     def _note_row_to_dict(c: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         d = dict(row)
         d["images"] = json.loads(d.pop("image_paths") or "[]")
+        d["image_thumbnails"] = json.loads(d.pop("image_thumbnails", None) or "[]")
+        d["image_ocr_texts"] = json.loads(d.pop("image_ocr_texts", None) or "[]")
         d["trip_purpose"] = json.loads(d.get("trip_purpose") or "[]")
         # Attach pois
         pois = c.execute(

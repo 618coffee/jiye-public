@@ -3,9 +3,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..config import settings
 from ..providers import get_embedding_provider, get_llm_provider
 from ..providers.llm import _CITY_HINTS
 from ..store.base import KnowledgeStore
+from . import ocr as ocr_service
 
 
 COUNTRY_FLAGS = {
@@ -96,6 +98,35 @@ def ingest_note(store: KnowledgeStore, raw: dict[str, Any]) -> str:
         for c, v in zip(chunks, vectors):
             c["embedding"] = v
 
+    # ---------- Image OCR + thumbnail pipeline ----------
+    ocr_results: list[ocr_service.OCRResult] = []
+    image_thumbnails: list[str | None] = []
+    image_ocr_texts: list[str] = []
+    if raw.get("images"):
+        ocr_results = ocr_service.process_images(
+            raw["id"],
+            raw.get("images") or [],
+            enabled=settings.ocr_enabled,
+        )
+        image_thumbnails = [r.thumb_url for r in ocr_results]
+        image_ocr_texts = [r.text for r in ocr_results]
+        # Persist OCR text as searchable chunks (one per image with detected text)
+        ocr_chunks: list[dict[str, Any]] = []
+        for r in ocr_results:
+            if r.text:
+                ocr_chunks.append({
+                    "chunk_type": "ocr",
+                    "text": r.text,
+                    "image_idx": r.image_idx,
+                })
+        if ocr_chunks:
+            ocr_vecs = embed.embed([c["text"] for c in ocr_chunks])
+            for c, v in zip(ocr_chunks, ocr_vecs):
+                c["embedding"] = v
+            chunks.extend(ocr_chunks)
+
+    image_index_level = 2 if any(r.text for r in ocr_results) else 1
+
     note = {
         **raw,
         "primary_city": extracted.get("primary_city"),
@@ -103,7 +134,9 @@ def ingest_note(store: KnowledgeStore, raw: dict[str, Any]) -> str:
         "city_confidence": extracted.get("city_confidence", 0.9),
         "trip_purpose": extracted.get("trip_purpose", []),
         "ai_summary": extracted.get("summary"),
-        "image_index_level": raw.get("image_index_level", 1),
+        "image_index_level": image_index_level,
+        "image_thumbnails": image_thumbnails,
+        "image_ocr_texts": image_ocr_texts,
         "chunks": chunks,
     }
     store.upsert_note(note)

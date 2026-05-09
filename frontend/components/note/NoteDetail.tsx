@@ -15,6 +15,12 @@ export function NoteDetail({ note }: { note: Note }) {
   const [idx, setIdx] = useState(0);
   const images = note.images.length > 0 ? note.images : [note.cover].filter(Boolean) as string[];
   const total = Math.max(images.length, 1);
+  const ocrTexts = note.image_ocr_texts || [];
+  const ocrForCurrent = ocrTexts[idx];
+  const totalOcr = ocrTexts.filter(Boolean).length;
+  // Prefer locally-cached thumbnail if available — proxied through Next rewrites at /thumbs.
+  const thumbs = note.image_thumbnails || [];
+  const displayImages = images.map((src, i) => thumbs[i] || src);
 
   return (
     <div className="space-y-6">
@@ -51,7 +57,7 @@ export function NoteDetail({ note }: { note: Note }) {
                 className="absolute inset-0"
               >
                 <SmartImage
-                  src={images[idx]}
+                  src={displayImages[idx]}
                   fallbackSeed={`${note.id}-${idx}`}
                   className="w-full h-full"
                 />
@@ -103,6 +109,22 @@ export function NoteDetail({ note }: { note: Note }) {
             <Card className="p-4 border-rouge-200/70 bg-gradient-to-br from-rouge-50 to-white">
               <div className="text-xs font-medium text-rouge-700 tracking-wide uppercase mb-1">AI 摘要</div>
               <p className="text-[15px] text-ink-800 leading-relaxed">{note.ai_summary}</p>
+            </Card>
+          )}
+
+          {totalOcr > 0 && (
+            <Card className="p-4 border-amber-200/70 bg-gradient-to-br from-amber-50 to-white">
+              <div className="flex items-center justify-between mb-1">
+                <div className="text-xs font-medium text-amber-700 tracking-wide uppercase">
+                  图片文字 OCR · {totalOcr}/{images.length}
+                </div>
+                <span className="text-[10px] text-amber-600">
+                  当前图 {idx + 1}/{total}
+                </span>
+              </div>
+              <p className="text-[13px] text-ink-700 leading-relaxed whitespace-pre-line min-h-[1.5em]">
+                {ocrForCurrent || <span className="text-ink-400">这张图未识别到文字</span>}
+              </p>
             </Card>
           )}
 
