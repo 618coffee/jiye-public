@@ -32,3 +32,7 @@ Thumbs.db
 # Models cache
 .cache/
 models/
+
+# OCR pipeline cache (regenerated on first seed)
+data/thumb/
+data/raw_seed/
