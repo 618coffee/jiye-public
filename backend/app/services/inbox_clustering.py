@@ -29,6 +29,8 @@ class ClusterRunResult:
     assigned: int
     skipped: int
     duration_s: float
+    low_confidence: int = 0  # titles routed to __low_conf__ catch-all
+    em_moves: int = 0        # titles that changed cluster during EM refinement
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -70,8 +72,10 @@ def cluster_inbox(
     *,
     status: str = "pending",
     target_clusters: int = 12,
-    sample_size: int = 200,
+    sample_size: int = 300,
     only_unassigned: bool = False,
+    em_iterations: int = 1,
+    min_similarity: float = 0.55,
 ) -> ClusterRunResult:
     """End-to-end: pull inbox, build clusters, write assignments.
 
@@ -136,33 +140,82 @@ def cluster_inbox(
     for i in range(0, len(titles), chunk):
         title_vecs.extend(embed.embed(titles[i : i + chunk]))
 
-    # 2c. Nearest-centroid assignment.
-    assignments: dict[str, list[str]] = {c["id"]: [] for c in proposed}
+    # 2c. Nearest-centroid assignment. Track score+vector per note for EM/threshold passes.
+    # per_note: note_id -> (cluster_idx, score, vec)
+    per_note: dict[str, tuple[int, float, list[float]]] = {}
     skipped = 0
     for row, vec in zip(rows, title_vecs):
         if not vec:
             skipped += 1
             continue
-        best_id, best_score = None, -2.0
-        for c, centroid in zip(proposed, centroids):
+        best_idx, best_score = -1, -2.0
+        for idx, centroid in enumerate(centroids):
             score = _cosine(vec, centroid)
             if score > best_score:
                 best_score = score
-                best_id = c["id"]
-        if best_id is not None:
-            assignments[best_id].append(row["note_id"])
+                best_idx = idx
+        if best_idx >= 0:
+            per_note[row["note_id"]] = (best_idx, best_score, vec)
+
+    # ---- Phase 2.5: EM refinement (recompute centroids from assigned vectors) ----
+    em_moves = 0
+    for _ in range(max(0, em_iterations)):
+        # Recompute centroid for each cluster with >=3 assigned members.
+        new_centroids = list(centroids)
+        for idx in range(len(proposed)):
+            members = [v for (ci, _s, v) in per_note.values() if ci == idx]
+            if len(members) >= 3:
+                try:
+                    new_centroids[idx] = _centroid(members)
+                except ValueError:
+                    pass
+        # Re-assign every note to nearest refined centroid.
+        moves = 0
+        for nid, (old_idx, _old_s, vec) in list(per_note.items()):
+            best_idx, best_score = -1, -2.0
+            for idx, centroid in enumerate(new_centroids):
+                score = _cosine(vec, centroid)
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+            if best_idx != old_idx:
+                moves += 1
+            per_note[nid] = (best_idx, best_score, vec)
+        em_moves += moves
+        centroids = new_centroids
+
+    # ---- Phase 3: Low-confidence threshold -> catch-all cluster ----
+    LOW_CONF_ID = "__low_conf__"
+    assignments: dict[str, list[str]] = {c["id"]: [] for c in proposed}
+    assignments[LOW_CONF_ID] = []
+    low_confidence = 0
+    for nid, (idx, score, _vec) in per_note.items():
+        if score < min_similarity:
+            assignments[LOW_CONF_ID].append(nid)
+            low_confidence += 1
+        else:
+            assignments[proposed[idx]["id"]].append(nid)
 
     # ---- Persist ----
     cluster_records: list[dict[str, Any]] = []
     for c in proposed:
         members = assignments.get(c["id"], [])
+        if members:
+            cluster_records.append({
+                "id": c["id"],
+                "name": c["name"],
+                "description": c["description"],
+                "count": len(members),
+            })
+    if low_confidence > 0:
         cluster_records.append({
-            "id": c["id"],
-            "name": c["name"],
-            "description": c["description"],
-            "count": len(members),
+            "id": LOW_CONF_ID,
+            "name": "其他（低置信度）",
+            "description": "e5 余弦相似度低于阈值的零散收藏",
+            "count": low_confidence,
         })
     store.replace_clusters(cluster_records)
+
     total_assigned = 0
     for cid, ids in assignments.items():
         if ids:
@@ -174,4 +227,6 @@ def cluster_inbox(
         assigned=total_assigned,
         skipped=skipped,
         duration_s=time.time() - t0,
+        low_confidence=low_confidence,
+        em_moves=em_moves,
     )

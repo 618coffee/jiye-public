@@ -101,6 +101,42 @@ export interface FreshnessRefreshResponse {
   pois: POI[];
 }
 
+export interface InboxItem {
+  note_id: string;
+  url: string;
+  title: string | null;
+  cover_url: string | null;
+  author: string | null;
+  saved_at: string | null;
+  discovered_at: string;
+  status: 'pending' | 'processing' | 'promoted' | 'discarded' | 'failed';
+  cluster_id: string | null;
+  raw_meta: Record<string, unknown>;
+  last_error: string | null;
+}
+
+export interface InboxCluster {
+  id: string;
+  name: string;
+  description: string | null;
+  count: number;
+  created_at: string;
+}
+
+export interface InboxStats {
+  by_status: Record<string, number>;
+  clusters: InboxCluster[];
+}
+
+export interface InboxClusterRunResult {
+  clusters: InboxCluster[];
+  assigned: number;
+  skipped: number;
+  duration_s: number;
+  low_confidence?: number;
+  em_moves?: number;
+}
+
 // Server-side (RSC) needs absolute URL pointing at the backend.
 // Client-side uses same-origin via next.config rewrites.
 const BASE = typeof window === 'undefined'
@@ -119,6 +155,17 @@ async function post<T>(path: string): Promise<T> {
   return r.json();
 }
 
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const r = await fetch(`${BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    cache: 'no-store',
+  });
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}: ${path}`);
+  return r.json();
+}
+
 export const api = {
   cities: () => get<{ cities: CitySummary[] }>('/api/cities'),
   workbench: (city: string) => get<WorkbenchData>(`/api/cities/${encodeURIComponent(city)}/workbench`),
@@ -130,4 +177,18 @@ export const api = {
     return get<SearchResponse>(`/api/search?${params.toString()}`);
   },
   settings: () => get<{ providers: Record<string, string>; data_dir: string; use_mock: string }>('/api/settings'),
+  inboxStats: () => get<InboxStats>('/api/inbox/stats'),
+  inboxList: (params: { status?: string; cluster_id?: string; title_query?: string; limit?: number; offset?: number }) => {
+    const qs = new URLSearchParams();
+    if (params.status) qs.set('status', params.status);
+    if (params.cluster_id) qs.set('cluster_id', params.cluster_id);
+    if (params.title_query) qs.set('title_query', params.title_query);
+    if (params.limit !== undefined) qs.set('limit', String(params.limit));
+    if (params.offset !== undefined) qs.set('offset', String(params.offset));
+    return get<{ items: InboxItem[]; limit: number; offset: number }>(`/api/inbox?${qs.toString()}`);
+  },
+  inboxRecluster: (body: { target_clusters?: number; sample_size?: number; em_iterations?: number; min_similarity?: number }) =>
+    postJson<InboxClusterRunResult>('/api/inbox/cluster', body),
+  inboxDiscard: (note_ids: string[]) =>
+    postJson<{ discarded: number }>('/api/inbox/discard', { note_ids }),
 };

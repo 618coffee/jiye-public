@@ -1,0 +1,759 @@
+'use client';
+
+import { useEffect, useMemo, useState, useTransition } from 'react';
+import {
+  Inbox as InboxIcon,
+  RefreshCw,
+  Trash2,
+  ExternalLink,
+  Search,
+  X,
+  CheckSquare,
+  Square,
+  Loader2,
+  Sparkles,
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Card } from '@/components/ui/Card';
+import { Button } from '@/components/ui/Button';
+import { Badge } from '@/components/ui/Badge';
+import { Input } from '@/components/ui/Input';
+import { SmartImage } from '@/components/ui/SmartImage';
+import { cn } from '@/lib/utils';
+import {
+  api,
+  type InboxItem,
+  type InboxCluster,
+  type InboxStats,
+  type InboxClusterRunResult,
+} from '@/lib/api';
+
+type StatusFilter = 'pending' | 'discarded' | 'promoted' | 'all';
+
+const STATUS_TONE: Record<InboxItem['status'], 'idle' | 'good' | 'warn' | 'bad' | 'accent'> = {
+  pending: 'idle',
+  promoted: 'good',
+  discarded: 'warn',
+  failed: 'bad',
+  processing: 'accent',
+};
+
+const STATUS_LABEL: Record<InboxItem['status'], string> = {
+  pending: '待处理',
+  promoted: '已入库',
+  discarded: '已丢弃',
+  failed: '失败',
+  processing: '处理中',
+};
+
+const PAGE_SIZE = 200;
+
+function useDebounced<T>(value: T, delay = 300): T {
+  const [v, setV] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setV(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return v;
+}
+
+export default function InboxPage() {
+  const [stats, setStats] = useState<InboxStats | null>(null);
+  const [items, setItems] = useState<InboxItem[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [clusterId, setClusterId] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('pending');
+  const [titleQuery, setTitleQuery] = useState('');
+  const debouncedQuery = useDebounced(titleQuery, 300);
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [, startTransition] = useTransition();
+
+  const [reclusterOpen, setReclusterOpen] = useState(false);
+  const [reclusterRunning, setReclusterRunning] = useState(false);
+  const [lastRun, setLastRun] = useState<InboxClusterRunResult | null>(null);
+
+  // Initial + after-discard stats refresh
+  async function loadStats() {
+    try {
+      const s = await api.inboxStats();
+      setStats(s);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'stats load failed';
+      setError(msg);
+    }
+  }
+
+  useEffect(() => {
+    loadStats();
+  }, []);
+
+  // Load items when filter changes
+  useEffect(() => {
+    setOffset(0);
+    setSelected(new Set());
+    void loadItems(0, /* append */ false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clusterId, statusFilter, debouncedQuery]);
+
+  async function loadItems(off: number, append: boolean) {
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await api.inboxList({
+        status: statusFilter === 'all' ? undefined : statusFilter,
+        cluster_id: clusterId ?? undefined,
+        title_query: debouncedQuery.trim() || undefined,
+        limit: PAGE_SIZE,
+        offset: off,
+      });
+      setItems((prev) => (append ? [...prev, ...r.items] : r.items));
+      setHasMore(r.items.length >= PAGE_SIZE);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'load failed';
+      setError(msg);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function toggle(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function selectAllVisible() {
+    setSelected(new Set(items.map((it) => it.note_id)));
+  }
+
+  async function discardSelected() {
+    if (selected.size === 0) return;
+    const ids = [...selected];
+    if (!confirm(`确认丢弃这 ${ids.length} 条收藏？此操作可在「已丢弃」状态下查看，但不会再参与聚类。`)) return;
+    try {
+      await api.inboxDiscard(ids);
+      // Optimistic remove
+      setItems((prev) => prev.filter((it) => !selected.has(it.note_id)));
+      setSelected(new Set());
+      await loadStats();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : '丢弃失败';
+      setError(msg);
+    }
+  }
+
+  async function runRecluster(target: number, sample: number, threshold: number, em: number) {
+    setReclusterRunning(true);
+    setError(null);
+    try {
+      const r = await api.inboxRecluster({
+        target_clusters: target,
+        sample_size: sample,
+        min_similarity: threshold,
+        em_iterations: em,
+      });
+      setLastRun(r);
+      await loadStats();
+      // Refresh current view
+      startTransition(() => {
+        void loadItems(0, false);
+        setOffset(0);
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : '聚类失败';
+      setError(msg);
+    } finally {
+      setReclusterRunning(false);
+    }
+  }
+
+  const pendingCount = stats?.by_status?.pending ?? 0;
+  const discardedCount = stats?.by_status?.discarded ?? 0;
+  const promotedCount = stats?.by_status?.promoted ?? 0;
+  const allClusters = stats?.clusters ?? [];
+
+  // Sorted clusters by count desc
+  const sortedClusters = useMemo(
+    () => [...allClusters].sort((a, b) => b.count - a.count),
+    [allClusters],
+  );
+
+  const selectedClusterName = useMemo(() => {
+    if (clusterId === null) return '全部';
+    if (clusterId === '__none__') return '未分类';
+    return allClusters.find((c) => c.id === clusterId)?.name ?? clusterId;
+  }, [clusterId, allClusters]);
+
+  return (
+    <div className="space-y-6">
+      {/* Header strip */}
+      <Card className="p-5 sm:p-6">
+        <div className="flex items-center gap-4 flex-wrap">
+          <div className="inline-flex items-center justify-center w-11 h-11 rounded-xl bg-rouge-50 text-rouge-600">
+            <InboxIcon className="w-5 h-5" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <h1 className="text-lg sm:text-xl font-semibold tracking-tight">收件箱</h1>
+            <p className="text-xs sm:text-sm text-ink-500 mt-0.5">
+              {stats ? (
+                <>
+                  <span className="font-medium text-ink-700">{pendingCount}</span> 待处理
+                  <span className="mx-2 text-ink-300">·</span>
+                  <span>{discardedCount}</span> 已丢弃
+                  <span className="mx-2 text-ink-300">·</span>
+                  <span>{promotedCount}</span> 已入库
+                  <span className="mx-2 text-ink-300">·</span>
+                  <span>{allClusters.length}</span> 个聚类
+                </>
+              ) : (
+                <span className="text-ink-400">载入中…</span>
+              )}
+            </p>
+          </div>
+          <Button
+            variant="soft"
+            size="md"
+            onClick={() => setReclusterOpen((v) => !v)}
+          >
+            <RefreshCw className="w-4 h-4" />
+            重新聚类
+          </Button>
+        </div>
+
+        <AnimatePresence initial={false}>
+          {reclusterOpen && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="overflow-hidden"
+            >
+              <ReclusterForm
+                running={reclusterRunning}
+                lastRun={lastRun}
+                onSubmit={(t, s, th, em) => runRecluster(t, s, th, em)}
+                onClose={() => setReclusterOpen(false)}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </Card>
+
+      {/* Two-column main */}
+      <div className="grid grid-cols-1 lg:grid-cols-[260px_1fr] gap-6">
+        {/* Sidebar (desktop) */}
+        <aside className="hidden lg:block">
+          <ClusterSidebar
+            clusters={sortedClusters}
+            selectedId={clusterId}
+            onSelect={setClusterId}
+            totalPending={pendingCount}
+          />
+        </aside>
+
+        {/* Mobile cluster chips */}
+        <div className="lg:hidden -mx-4 px-4">
+          <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-thin">
+            <ClusterChip
+              label="全部"
+              count={pendingCount}
+              active={clusterId === null}
+              onClick={() => setClusterId(null)}
+            />
+            {sortedClusters.map((c) => (
+              <ClusterChip
+                key={c.id}
+                label={c.name}
+                count={c.count}
+                active={clusterId === c.id}
+                onClick={() => setClusterId(c.id)}
+              />
+            ))}
+          </div>
+        </div>
+
+        {/* Right column */}
+        <section className="space-y-4 min-w-0">
+          {/* Filter strip */}
+          <Card className="p-3 flex flex-col sm:flex-row sm:items-center gap-3">
+            <div className="flex items-center gap-2 flex-1 min-w-0">
+              <Search className="w-4 h-4 text-ink-400 flex-shrink-0" />
+              <Input
+                value={titleQuery}
+                onChange={(e) => setTitleQuery(e.target.value)}
+                placeholder={`在「${selectedClusterName}」中搜索标题…`}
+                className="h-9 text-sm border-0 shadow-none focus:ring-0 px-1"
+              />
+              {titleQuery && (
+                <button
+                  onClick={() => setTitleQuery('')}
+                  className="p-1 rounded hover:bg-ink-100 text-ink-400"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-ink-400">状态</span>
+              <select
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}
+                className="h-9 text-sm rounded-lg border border-ink-200 bg-white px-2 focus:outline-none focus:border-rouge-400"
+              >
+                <option value="pending">待处理</option>
+                <option value="discarded">已丢弃</option>
+                <option value="promoted">已入库</option>
+                <option value="all">全部</option>
+              </select>
+              <span className="text-xs text-ink-400 ml-2 whitespace-nowrap">
+                {loading ? '…' : `${items.length} 条`}
+              </span>
+            </div>
+          </Card>
+
+          {/* Bulk action bar */}
+          <AnimatePresence>
+            {selected.size > 0 && (
+              <motion.div
+                initial={{ opacity: 0, y: -6 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -6 }}
+                className="sticky top-16 z-20"
+              >
+                <div className="rounded-2xl bg-ink-900 text-white shadow-lg px-4 py-3 flex items-center gap-3">
+                  <CheckSquare className="w-4 h-4" />
+                  <span className="text-sm font-medium">已选 {selected.size} 条</span>
+                  <div className="flex-1" />
+                  <button
+                    onClick={selectAllVisible}
+                    className="text-xs px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 transition"
+                  >
+                    全选当前页
+                  </button>
+                  <button
+                    onClick={() => setSelected(new Set())}
+                    className="text-xs px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 transition"
+                  >
+                    取消
+                  </button>
+                  <button
+                    onClick={discardSelected}
+                    className="text-xs px-3 py-1.5 rounded-lg bg-rose-500 hover:bg-rose-600 transition inline-flex items-center gap-1.5 font-medium"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    丢弃
+                  </button>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Error */}
+          {error && (
+            <Card className="p-4 border-rose-200 bg-rose-50/80 text-rose-700 text-sm">
+              {error}
+            </Card>
+          )}
+
+          {/* Grid */}
+          {loading && items.length === 0 ? (
+            <SkeletonGrid />
+          ) : items.length === 0 ? (
+            <EmptyState clusterName={selectedClusterName} />
+          ) : (
+            <>
+              <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
+                <AnimatePresence initial={false}>
+                  {items.map((it) => (
+                    <motion.div
+                      key={it.note_id}
+                      layout
+                      initial={{ opacity: 0, scale: 0.96 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.92 }}
+                      transition={{ duration: 0.18 }}
+                    >
+                      <InboxCard
+                        item={it}
+                        selected={selected.has(it.note_id)}
+                        onToggle={() => toggle(it.note_id)}
+                      />
+                    </motion.div>
+                  ))}
+                </AnimatePresence>
+              </div>
+
+              {hasMore && (
+                <div className="flex justify-center pt-2">
+                  <Button
+                    variant="soft"
+                    size="md"
+                    disabled={loading}
+                    onClick={() => {
+                      const next = offset + PAGE_SIZE;
+                      setOffset(next);
+                      void loadItems(next, true);
+                    }}
+                  >
+                    {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                    加载更多
+                  </Button>
+                </div>
+              )}
+            </>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+// -------------------------- Subcomponents --------------------------
+
+function ClusterSidebar({
+  clusters,
+  selectedId,
+  onSelect,
+  totalPending,
+}: {
+  clusters: InboxCluster[];
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+  totalPending: number;
+}) {
+  return (
+    <div className="sticky top-24 max-h-[calc(100vh-7rem)] overflow-y-auto pr-1 space-y-1">
+      <SidebarRow
+        active={selectedId === null}
+        onClick={() => onSelect(null)}
+        name="全部"
+        count={totalPending}
+        emphasis
+      />
+      {clusters.map((c) => (
+        <SidebarRow
+          key={c.id}
+          active={selectedId === c.id}
+          onClick={() => onSelect(c.id)}
+          name={c.name}
+          description={c.description}
+          count={c.count}
+          isCatchAll={c.id === '__low_conf__'}
+        />
+      ))}
+    </div>
+  );
+}
+
+function SidebarRow({
+  active,
+  onClick,
+  name,
+  description,
+  count,
+  emphasis,
+  isCatchAll,
+}: {
+  active: boolean;
+  onClick: () => void;
+  name: string;
+  description?: string | null;
+  count: number;
+  emphasis?: boolean;
+  isCatchAll?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        'w-full text-left px-3 py-2.5 rounded-xl transition-all border',
+        active
+          ? 'bg-rouge-50/80 border-rouge-200 ring-1 ring-rouge-200/60'
+          : 'bg-transparent border-transparent hover:bg-ink-100/60',
+      )}
+    >
+      <div className="flex items-center gap-2">
+        <div className="flex-1 min-w-0">
+          <div
+            className={cn(
+              'text-sm line-clamp-1',
+              emphasis ? 'font-semibold text-ink-900' : 'font-medium text-ink-800',
+              isCatchAll && 'italic text-ink-600',
+            )}
+          >
+            {name}
+          </div>
+          {description && (
+            <div className="text-[11px] text-ink-400 line-clamp-1 mt-0.5">{description}</div>
+          )}
+        </div>
+        <span
+          className={cn(
+            'text-[11px] tabular-nums px-1.5 py-0.5 rounded-md',
+            active ? 'bg-rouge-100 text-rouge-700' : 'bg-ink-100 text-ink-500',
+          )}
+        >
+          {count}
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function ClusterChip({
+  label,
+  count,
+  active,
+  onClick,
+}: {
+  label: string;
+  count: number;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        'flex-shrink-0 inline-flex items-center gap-1.5 h-8 px-3 rounded-full text-xs transition',
+        active
+          ? 'bg-ink-900 text-white'
+          : 'bg-white border border-ink-200 text-ink-700 hover:border-ink-300',
+      )}
+    >
+      <span>{label}</span>
+      <span className={cn('tabular-nums', active ? 'text-white/70' : 'text-ink-400')}>
+        {count}
+      </span>
+    </button>
+  );
+}
+
+function InboxCard({
+  item,
+  selected,
+  onToggle,
+}: {
+  item: InboxItem;
+  selected: boolean;
+  onToggle: () => void;
+}) {
+  const tone = STATUS_TONE[item.status];
+  const label = STATUS_LABEL[item.status];
+  return (
+    <Card
+      className={cn(
+        'overflow-hidden card-lift cursor-pointer relative group flex flex-col',
+        selected && 'ring-2 ring-rouge-400 ring-offset-2 ring-offset-mesh',
+      )}
+      onClick={onToggle}
+    >
+      <div className="relative aspect-[4/5] overflow-hidden bg-ink-100">
+        <SmartImage
+          src={item.cover_url}
+          alt={item.title ?? ''}
+          fallbackSeed={item.note_id}
+          className="w-full h-full transition-transform duration-700 ease-out group-hover:scale-[1.04]"
+        />
+        {/* Checkbox overlay */}
+        <div
+          className={cn(
+            'absolute top-2 left-2 w-6 h-6 rounded-md flex items-center justify-center transition',
+            selected
+              ? 'bg-rouge-500 text-white'
+              : 'bg-white/85 text-ink-500 opacity-0 group-hover:opacity-100',
+          )}
+        >
+          {selected ? <CheckSquare className="w-4 h-4" /> : <Square className="w-4 h-4" />}
+        </div>
+        {item.status !== 'pending' && (
+          <div className="absolute top-2 right-2">
+            <Badge tone={tone}>{label}</Badge>
+          </div>
+        )}
+      </div>
+      <div className="p-3 flex-1 flex flex-col gap-1.5">
+        <div
+          className="text-[13px] font-medium text-ink-800 leading-snug line-clamp-2"
+          title={item.title ?? ''}
+        >
+          {item.title || <span className="text-ink-400">（无标题）</span>}
+        </div>
+        <div className="flex items-center justify-between gap-2 mt-auto pt-1">
+          <div className="text-[11px] text-ink-400 line-clamp-1 flex-1 min-w-0">
+            {item.author || '匿名'}
+          </div>
+          {item.url && (
+            <a
+              href={item.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              className="p-1 rounded hover:bg-ink-100 text-ink-400 hover:text-ink-700 transition"
+              title="在小红书打开"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+            </a>
+          )}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function SkeletonGrid() {
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
+      {Array.from({ length: 8 }).map((_, i) => (
+        <Card key={i} className="overflow-hidden">
+          <div className="skeleton aspect-[4/5]" />
+          <div className="p-3 space-y-2">
+            <div className="skeleton h-3.5 w-full" />
+            <div className="skeleton h-3.5 w-2/3" />
+          </div>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+function EmptyState({ clusterName }: { clusterName: string }) {
+  return (
+    <Card className="p-12 text-center text-ink-500">
+      <div className="inline-flex w-12 h-12 rounded-full bg-ink-100 items-center justify-center mb-3">
+        <InboxIcon className="w-5 h-5 text-ink-400" />
+      </div>
+      <div className="text-sm">「{clusterName}」中没有匹配的收藏</div>
+      <div className="text-xs text-ink-400 mt-1">换个状态、换个聚类，或清空搜索试试</div>
+    </Card>
+  );
+}
+
+function ReclusterForm({
+  running,
+  lastRun,
+  onSubmit,
+  onClose,
+}: {
+  running: boolean;
+  lastRun: InboxClusterRunResult | null;
+  onSubmit: (target: number, sample: number, threshold: number, em: number) => void;
+  onClose: () => void;
+}) {
+  const [target, setTarget] = useState(12);
+  const [sample, setSample] = useState(300);
+  const [threshold, setThreshold] = useState(0.55);
+  const [em, setEm] = useState(1);
+
+  return (
+    <div className="mt-4 pt-4 border-t border-ink-200/70">
+      <div className="flex items-center gap-2 text-rouge-600 text-xs font-medium mb-3">
+        <Sparkles className="w-3.5 h-3.5" />
+        重新聚类参数
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <FormNumber
+          label="目标簇数"
+          value={target}
+          onChange={setTarget}
+          min={2}
+          max={30}
+          hint="LLM 会输出大致这么多个分类"
+        />
+        <FormNumber
+          label="样本数"
+          value={sample}
+          onChange={setSample}
+          min={10}
+          max={1000}
+          step={50}
+          hint="LLM 看多少标题来定义簇（越大越稳）"
+        />
+        <FormNumber
+          label="EM 迭代"
+          value={em}
+          onChange={setEm}
+          min={0}
+          max={3}
+          hint="0=纯 LLM 中心点，1+=用真实分布修正"
+        />
+        <FormNumber
+          label="低置信阈值"
+          value={threshold}
+          onChange={setThreshold}
+          min={0}
+          max={1}
+          step={0.05}
+          float
+          hint="余弦低于此值进入「低置信度」"
+        />
+      </div>
+
+      <div className="flex items-center gap-3 mt-4">
+        <Button onClick={() => onSubmit(target, sample, threshold, em)} disabled={running} size="md">
+          {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+          {running ? '聚类中…' : '运行'}
+        </Button>
+        <Button variant="ghost" size="md" onClick={onClose} disabled={running}>
+          收起
+        </Button>
+        <div className="flex-1" />
+        {lastRun && (
+          <div className="text-xs text-ink-500">
+            上次：分配 <b className="text-ink-700">{lastRun.assigned}</b> · 低置信{' '}
+            <b className="text-ink-700">{lastRun.low_confidence ?? 0}</b> · EM 移动{' '}
+            <b className="text-ink-700">{lastRun.em_moves ?? 0}</b> · 用时{' '}
+            <b className="text-ink-700">{lastRun.duration_s}s</b>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FormNumber({
+  label,
+  value,
+  onChange,
+  min,
+  max,
+  step = 1,
+  float,
+  hint,
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+  min: number;
+  max: number;
+  step?: number;
+  float?: boolean;
+  hint?: string;
+}) {
+  return (
+    <label className="flex flex-col gap-1">
+      <span className="text-[11px] text-ink-500">{label}</span>
+      <input
+        type="number"
+        value={value}
+        min={min}
+        max={max}
+        step={step}
+        onChange={(e) => {
+          const raw = e.target.value;
+          const v = float ? parseFloat(raw) : parseInt(raw, 10);
+          if (!isNaN(v)) onChange(Math.max(min, Math.min(max, v)));
+        }}
+        className="h-9 px-2 text-sm rounded-lg border border-ink-200 bg-white focus:outline-none focus:border-rouge-400 tabular-nums"
+      />
+      {hint && <span className="text-[10px] text-ink-400 leading-tight">{hint}</span>}
+    </label>
+  );
+}

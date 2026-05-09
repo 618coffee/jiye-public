@@ -23,6 +23,20 @@ except ImportError as e:  # pragma: no cover
 
 
 XHS_HOSTS = ("xiaohongshu.com", "www.xiaohongshu.com")
+# Heuristics for "this tab is showing a collection-style feed" — anything else
+# (homepage 推荐流, search results, single-note detail) is rejected so we never
+# accidentally crawl the wrong thing.
+COLLECTION_URL_HINTS = (
+    "tab=fav",              # /user/profile/<uid>?tab=fav&subTab=note
+    "subtab=note",
+    "tabname=collect",      # 旧版 layout
+    "subtabtype=collect",
+    "tab=collect",
+    "/user/profile/",       # bare profile URL — xhs hides the tab state in JS,
+                            # so we trust the user opened the right tab manually
+    "/board/",              # 专辑/合集页
+    "fav",                  # last-resort, also matches ?type=fav etc.
+)
 # Note links rendered on the collection page look like:
 #   /explore/<note_id>?xsec_token=xxx&xsec_source=pc_collect
 NOTE_HREF_RE = re.compile(r"/(?:explore|discovery/item)/([0-9a-f]{18,32})", re.IGNORECASE)
@@ -130,8 +144,10 @@ class XhsCollectionCrawler:
     def __init__(self, config: CrawlerConfig | None = None):
         self.config = config or CrawlerConfig()
 
-    async def _find_xhs_page(self, browser: Browser) -> Page:
-        """Pick the best existing xhs tab; raise if none."""
+    async def _find_xhs_page(self, browser: Browser, *, target_url: str | None = None) -> Page:
+        """Pick the collection tab; raise if none. If target_url is given,
+        navigate the chosen tab there first.
+        """
         candidates: list[Page] = []
         for ctx in browser.contexts:
             for page in ctx.pages:
@@ -147,16 +163,97 @@ class XhsCollectionCrawler:
                 "Open https://www.xiaohongshu.com in your Chrome window, "
                 "log in, navigate to your profile's 收藏 tab, then re-run."
             )
-        # Prefer a tab whose URL hints at the collection page.
+
+        # If user passed a target URL, just take the first xhs tab and goto it.
+        if target_url:
+            page = candidates[0]
+            await page.goto(target_url, wait_until="domcontentloaded")
+            return page
+
+        # Otherwise we MUST find a tab that looks like a collection feed.
+        # Generic "xiaohongshu.com" or homepage "/" are explicitly rejected to
+        # avoid crawling the 推荐 (recommendation) feed by mistake.
         for p in candidates:
-            if "collect" in (p.url or "") or "user/profile" in (p.url or ""):
+            url_lower = (p.url or "").lower()
+            if any(hint in url_lower for hint in COLLECTION_URL_HINTS):
                 return p
-        return candidates[0]
+
+        # No collection-like tab found — list what we did see, so the user
+        # knows which tab needs adjustment.
+        seen = "\n  - ".join(p.url for p in candidates)
+        raise CrawlerError(
+            "Found xiaohongshu tabs but none look like a 收藏 page. "
+            "Either:\n"
+            "  (a) navigate one of the tabs to your profile -> 收藏 tab "
+            "(URL should contain 'tabName=collect' or similar), then re-run; or\n"
+            "  (b) re-run with --url <full collection URL>.\n"
+            f"Tabs seen:\n  - {seen}"
+        )
+
+    async def _ensure_collection_tab(self, page: Page) -> None:
+        """Click the 收藏 tab on the profile page if it isn't already active.
+
+        XHS doesn't reflect tab state in the URL, so we must inspect the DOM.
+        We try several locator strategies (xhs ships A/B layouts), and verify
+        success by waiting for the active tab text to be 收藏 — but never raise
+        if we can't find it: the user may have already manually clicked it,
+        in which case the existing DOM probe will still find items.
+        """
+        # Quick check: if there's already an "active" tab labelled 收藏, do nothing.
+        already_active = await page.evaluate(
+            """
+            () => {
+              const nodes = Array.from(document.querySelectorAll(
+                '[class*="active"], [class*="Active"], [aria-selected="true"]'
+              ));
+              return nodes.some(n => (n.textContent || '').trim() === '收藏');
+            }
+            """
+        )
+        if already_active:
+            if self.config.debug_dom:
+                print("[crawler] 收藏 tab already active")
+            return
+
+        # Try clicking. We use page.evaluate rather than locator() because xhs
+        # often wraps the tab text in a span/div with no stable selector, and
+        # we need to walk up to find the actual clickable ancestor.
+        clicked = await page.evaluate(
+            """
+            () => {
+              const all = Array.from(document.querySelectorAll('div, span, a, li'));
+              const target = all.find(el => {
+                const t = (el.textContent || '').trim();
+                // Only leaf-ish nodes whose text IS exactly 收藏 (avoid matching
+                // a parent container that happens to include the word).
+                return t === '收藏' && el.children.length <= 1;
+              });
+              if (!target) return false;
+              // Click the deepest reasonable interactive ancestor.
+              let cur = target;
+              for (let i = 0; i < 4 && cur; i++) {
+                cur.click();
+                cur = cur.parentElement;
+              }
+              return true;
+            }
+            """
+        )
+        if self.config.debug_dom:
+            print(f"[crawler] tab click attempt: clicked={clicked}")
+        if not clicked:
+            print("[crawler] WARNING: could not find a 收藏 tab to click. "
+                  "If you're already on the right tab manually, this is fine.")
+            return
+
+        # Give the SPA a moment to swap feeds.
+        await asyncio.sleep(1.2)
 
     async def scan(
         self,
         *,
         progress_cb: Callable[[CrawlerResult], None] | None = None,
+        target_url: str | None = None,
     ) -> CrawlerResult:
         cfg = self.config
         result = CrawlerResult()
@@ -170,7 +267,7 @@ class XhsCollectionCrawler:
                     f"  underlying error: {e}"
                 ) from e
 
-            page = await self._find_xhs_page(browser)
+            page = await self._find_xhs_page(browser, target_url=target_url)
             result.page_url = page.url
 
             # Bring it forward so lazy-loaded thumbnails actually paint.
@@ -178,6 +275,12 @@ class XhsCollectionCrawler:
                 await page.bring_to_front()
             except Exception:
                 pass
+
+            # XHS renders a tab strip on the profile page (笔记 / 收藏 / 点赞)
+            # but does NOT change the URL when you switch tabs. So even though
+            # the URL says /user/profile/<uid>, we may still be on 笔记. Click
+            # 收藏 to force the right feed before we start probing.
+            await self._ensure_collection_tab(page)
 
             # Initial probe so we know the renderer is live.
             try:

@@ -41,6 +41,7 @@ export function TopBar() {
 
         <nav className="hidden md:flex items-center gap-1 ml-4">
           <NavLink href="/" active={path === '/'}>目的地</NavLink>
+          <NavLink href="/inbox" active={path?.startsWith('/inbox') ?? false}>收件箱</NavLink>
           <NavLink href="/search" active={path?.startsWith('/search') ?? false}>搜索</NavLink>
           <NavLink href="/settings" active={path?.startsWith('/settings') ?? false}>设置</NavLink>
         </nav>

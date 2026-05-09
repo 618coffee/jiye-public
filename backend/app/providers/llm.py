@@ -427,13 +427,13 @@ class AzureOpenAILLMProvider(LLMProvider):
             '    "id": "短英文 slug，如 food-jp / cafe-sh / fitness / fashion-outfit",\n'
             '    "name": "中文标签（6-12 字，例如「京都美食」「上海咖啡」「健身打卡」）",\n'
             '    "description": "一句话说明这个簇收什么样的帖子（≤30 字）",\n'
-            '    "sample_titles": ["挑 2-4 条最有代表性的原标题"]\n'
+            '    "sample_titles": ["挑 8-12 条最有代表性的原标题（多一些样本能让后续 EM 更稳健）"]\n'
             '  },\n'
             "  ...\n"
             "]\n"
             "注意：\n"
             f"1) 簇数控制在 {max(target_clusters - 4, 6)}-{target_clusters + 4} 之间，太多就合并；\n"
-            "2) sample_titles 必须是上面列表里出现过的原文；\n"
+            "2) sample_titles 必须是上面列表里出现过的原文，每个簇 8-12 条；\n"
             "3) 每条标题尽量只归到一个簇，但允许 ≤10% 标题不属于任何明显簇——把它们归到 id='other' / name='其他';\n"
             "4) 不要返回 markdown，只返回 JSON 数组。"
         )
@@ -444,7 +444,7 @@ class AzureOpenAILLMProvider(LLMProvider):
                     {"role": "user", "content": prompt},
                 ],
                 json_mode=True,
-                max_tokens=2400,
+                max_tokens=8000,
                 temperature=0.3,
             )
             data = _parse_json_lenient(content)
@@ -464,6 +464,7 @@ class AzureOpenAILLMProvider(LLMProvider):
                     except Exception:
                         data = None
             if not isinstance(data, list) or not data:
+                print(f"[llm.cluster_titles] parse returned non-list (len(content)={len(content or '')}); falling back to mock")
                 return MockLLMProvider().cluster_titles(titles, target_clusters=target_clusters)
             # Sanitise each cluster
             seen_ids: set[str] = set()
@@ -481,7 +482,7 @@ class AzureOpenAILLMProvider(LLMProvider):
                 seen_ids.add(cid)
                 name = (c.get("name") or "").strip()[:24] or "未命名"
                 desc = (c.get("description") or "").strip()[:60]
-                samples = [s for s in (c.get("sample_titles") or []) if isinstance(s, str)][:4]
+                samples = [s for s in (c.get("sample_titles") or []) if isinstance(s, str)][:16]
                 cleaned.append({
                     "id": cid,
                     "name": name,
@@ -489,7 +490,10 @@ class AzureOpenAILLMProvider(LLMProvider):
                     "sample_titles": samples,
                 })
             return cleaned
-        except Exception:
+        except Exception as e:
+            import traceback
+            print(f"[llm.cluster_titles] FAILED, falling back to mock: {e}")
+            traceback.print_exc()
             return MockLLMProvider().cluster_titles(titles, target_clusters=target_clusters)
 
 

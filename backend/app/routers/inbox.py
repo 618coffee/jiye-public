@@ -57,25 +57,35 @@ def run_clustering(
     store: SqliteStore = Depends(get_store),
 ) -> dict[str, Any]:
     target = int(payload.get("target_clusters", 12))
-    sample = int(payload.get("sample_size", 200))
+    sample = int(payload.get("sample_size", 300))
     status = payload.get("status", "pending")
     only_unassigned = bool(payload.get("only_unassigned", False))
+    em_iterations = int(payload.get("em_iterations", 1))
+    min_similarity = float(payload.get("min_similarity", 0.55))
     if target < 2 or target > 30:
         raise HTTPException(400, "target_clusters must be in [2, 30]")
     if sample < 10 or sample > 1000:
         raise HTTPException(400, "sample_size must be in [10, 1000]")
+    if em_iterations < 0 or em_iterations > 3:
+        raise HTTPException(400, "em_iterations must be in [0, 3]")
+    if min_similarity < 0.0 or min_similarity > 1.0:
+        raise HTTPException(400, "min_similarity must be in [0.0, 1.0]")
     res = cluster_inbox(
         store,
         status=status,
         target_clusters=target,
         sample_size=sample,
         only_unassigned=only_unassigned,
+        em_iterations=em_iterations,
+        min_similarity=min_similarity,
     )
     return {
         "clusters": res.clusters,
         "assigned": res.assigned,
         "skipped": res.skipped,
         "duration_s": round(res.duration_s, 2),
+        "low_confidence": res.low_confidence,
+        "em_moves": res.em_moves,
     }
 
 

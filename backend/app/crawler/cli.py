@@ -45,7 +45,8 @@ async def cmd_scan_inbox(args: argparse.Namespace) -> int:
     crawler = XhsCollectionCrawler(cfg)
     try:
         result = await crawler.scan(
-            progress_cb=None if args.debug else _print_progress
+            progress_cb=None if args.debug else _print_progress,
+            target_url=args.url,
         )
     except CrawlerError as e:
         sys.stdout.write("\n")
@@ -100,6 +101,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="Verbose DOM probe logs")
     p.add_argument("--dry-run", action="store_true",
                    help="Print results without writing to db")
+    p.add_argument("--url", default=None,
+                   help="Optional: navigate the chosen tab to this URL before "
+                        "crawling (use your full collection page URL)")
 
     args = parser.parse_args(argv)
     return asyncio.run(cmd_scan_inbox(args))
