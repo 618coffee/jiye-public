@@ -90,6 +90,7 @@ export default function InboxPage() {
     updated: number;
     early_stopped?: boolean;
     incremental?: boolean;
+    auto_cluster?: { assigned: number; unclustered: number; reason?: string };
   } | null>(null);
 
   // Initial + after-discard stats refresh
@@ -251,6 +252,7 @@ export default function InboxPage() {
         updated: r.updated,
         early_stopped: r.early_stopped,
         incremental: r.incremental,
+        auto_cluster: r.auto_cluster,
       });
       await loadStats();
       startTransition(() => {
@@ -529,6 +531,12 @@ export default function InboxPage() {
                 {lastScan.incremental ? '增量扫描' : '全量扫描'}完成：本次见到 {lastScan.scanned} 条 ·
                 新增 {lastScan.inserted} · 更新 {lastScan.updated}
                 {lastScan.early_stopped ? ' · 命中已知笔记后提前结束' : ''}
+                {lastScan.auto_cluster && (lastScan.auto_cluster.assigned > 0 || lastScan.auto_cluster.unclustered > 0)
+                  ? ` · 自动归类 ${lastScan.auto_cluster.assigned}` +
+                    (lastScan.auto_cluster.unclustered > 0
+                      ? ` · ${lastScan.auto_cluster.unclustered} 条未聚类`
+                      : '')
+                  : ''}
               </span>
               <button
                 onClick={() => setLastScan(null)}

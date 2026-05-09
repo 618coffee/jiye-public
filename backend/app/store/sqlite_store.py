@@ -772,6 +772,32 @@ class SqliteStore(KnowledgeStore):
                     ),
                 )
 
+    def upsert_cluster(self, cluster: dict[str, Any]) -> None:
+        """Insert or update a single cluster row without wiping the table.
+
+        Used by incremental flows (e.g. auto-assign on scan) to materialise
+        the synthetic ``__unclustered__`` bucket without touching existing
+        clusters. ``count`` is recomputed from ``note_inbox`` to stay honest.
+        """
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        cid = cluster["id"]
+        with self._conn() as c:
+            count = c.execute(
+                "SELECT COUNT(*) AS n FROM note_inbox WHERE cluster_id = ?",
+                (cid,),
+            ).fetchone()["n"]
+            c.execute(
+                """INSERT INTO inbox_clusters
+                     (id, name, description, count, created_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     name=excluded.name,
+                     description=excluded.description,
+                     count=excluded.count""",
+                (cid, cluster.get("name", cid), cluster.get("description"), count, now),
+            )
+
     def get_inbox_times(
         self, note_ids: list[str]
     ) -> list[tuple[str | None, str | None]]:

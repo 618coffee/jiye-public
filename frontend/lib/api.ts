@@ -227,5 +227,6 @@ export const api = {
       early_stopped?: boolean;
       incremental?: boolean;
       by_status: Record<string, number>;
+      auto_cluster?: { assigned: number; unclustered: number; reason?: string };
     }>('/api/inbox/scan', body ?? {}),
 };

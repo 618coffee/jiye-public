@@ -7,7 +7,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 
 from ..config import settings
 from ..crawler.xhs import CrawlerConfig, CrawlerError, XhsCollectionCrawler
-from ..services.inbox_clustering import cluster_inbox
+from ..services.inbox_clustering import assign_to_existing_clusters, cluster_inbox
 from ..services.inbox_promote import (
     DEFAULT_MAX_PER_REQUEST,
     HARD_MAX_PER_REQUEST,
@@ -193,13 +193,13 @@ async def scan_collection(
     # early once the visible feed is entirely "old". Skipped when full=true
     # or when the inbox is empty (nothing to dedupe against → cold start).
     known_ids: set[str] | None = None
+    pre_scan_ids: set[str] = set()
+    try:
+        pre_scan_ids = store.all_inbox_ids()
+    except Exception:
+        pre_scan_ids = set()
     if not full_scan:
-        try:
-            known_ids = store.all_inbox_ids()
-        except Exception:
-            known_ids = None
-        if known_ids is not None and not known_ids:
-            known_ids = None  # cold start, no point in early-exit logic
+        known_ids = pre_scan_ids if pre_scan_ids else None
 
     crawler = XhsCollectionCrawler(cfg)
     try:
@@ -233,6 +233,18 @@ async def scan_collection(
         for it in result.items
     ]
     counts = store.upsert_inbox_many(inbox_payload)
+
+    # Auto-assign newly-inserted notes to nearest existing cluster.
+    # Never raises: anything weird → notes get tagged "未聚类" so they're
+    # still visible and will be folded back in on the next full re-cluster.
+    new_ids = [it["note_id"] for it in result.items if it["note_id"] not in pre_scan_ids]
+    auto_cluster: dict[str, Any] = {"assigned": 0, "unclustered": 0}
+    if new_ids:
+        try:
+            auto_cluster = assign_to_existing_clusters(store, new_ids)
+        except Exception as e:  # belt-and-suspenders; service already swallows
+            auto_cluster = {"assigned": 0, "unclustered": len(new_ids), "reason": f"unexpected: {e}"}
+
     return {
         "scanned": len(result.items),
         "inserted": counts["inserted"],
@@ -241,4 +253,5 @@ async def scan_collection(
         "early_stopped": result.early_stopped,
         "incremental": known_ids is not None,
         "by_status": store.inbox_status_counts(),
+        "auto_cluster": auto_cluster,
     }

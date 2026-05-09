@@ -265,3 +265,157 @@ def cluster_inbox(
         low_confidence=low_confidence,
         em_moves=em_moves,
     )
+
+
+# ---------------------------------------------------------------------------
+# Incremental: assign newly-scanned notes to the nearest existing cluster.
+# Falls back to a synthetic ``__unclustered__`` bucket on any failure
+# (no embedding provider, no clusters yet, LLM/network errors, etc.) so
+# the user never silently loses notes — they're visible under a "未聚类"
+# label and will be folded back in on the next full re-cluster.
+# ---------------------------------------------------------------------------
+
+UNCLUSTERED_ID = "__unclustered__"
+UNCLUSTERED_NAME = "未聚类"
+UNCLUSTERED_DESC = "新增时未能自动归类（聚类服务暂不可用或无现有聚类）。下次「重新聚类」时会被重新分配。"
+
+
+def _mark_unclustered(store: KnowledgeStore, note_ids: list[str], reason: str) -> dict[str, Any]:
+    """Tag every note_id as ``__unclustered__`` and ensure the bucket exists."""
+    if not note_ids:
+        return {"assigned": 0, "unclustered": 0, "reason": reason}
+    store.set_inbox_cluster(note_ids, UNCLUSTERED_ID)
+    try:
+        store.upsert_cluster({  # type: ignore[attr-defined]
+            "id": UNCLUSTERED_ID,
+            "name": UNCLUSTERED_NAME,
+            "description": UNCLUSTERED_DESC,
+        })
+    except Exception:
+        pass  # cluster bucket is cosmetic; the note_inbox.cluster_id is what matters
+    return {"assigned": 0, "unclustered": len(note_ids), "reason": reason}
+
+
+def assign_to_existing_clusters(
+    store: KnowledgeStore,
+    new_note_ids: list[str],
+    *,
+    min_similarity: float = 0.55,
+    sample_per_cluster: int = 30,
+) -> dict[str, Any]:
+    """Classify *new* inbox notes into the nearest existing cluster.
+
+    Designed for the post-scan path: cheap (no LLM), embedding-only, and
+    never throws — anything that goes wrong (no provider, no clusters,
+    embedding error) results in the notes being tagged ``__unclustered__``
+    so a future full re-cluster can sweep them up.
+
+    Returns ``{assigned, unclustered, reason?, by_cluster?}``.
+    """
+    if not new_note_ids:
+        return {"assigned": 0, "unclustered": 0}
+
+    # 1) Existing clusters?
+    try:
+        existing = [c for c in store.list_clusters() if c["id"] != UNCLUSTERED_ID]
+    except Exception as e:
+        return _mark_unclustered(store, new_note_ids, f"list_clusters failed: {e}")
+    if not existing:
+        return _mark_unclustered(store, new_note_ids, "no existing clusters yet")
+
+    # 2) Pull each cluster's member titles to rebuild a centroid.
+    try:
+        embed = get_embedding_provider()
+    except Exception as e:
+        return _mark_unclustered(store, new_note_ids, f"no embedding provider: {e}")
+
+    cluster_titles: list[tuple[str, list[str]]] = []  # (cluster_id, titles[])
+    for c in existing:
+        cid = c["id"]
+        try:
+            members = store.list_inbox(cluster_id=cid, status=None, limit=sample_per_cluster)
+        except Exception:
+            members = []
+        titles = [m.get("title") or "" for m in members if (m.get("title") or "").strip()]
+        if not titles:
+            # fall back to the cluster name itself so it still gets a centroid
+            titles = [c.get("name") or cid]
+        cluster_titles.append((cid, titles))
+
+    # 3) Pull new note titles in one go.
+    try:
+        new_rows = [store.get_inbox(nid) for nid in new_note_ids]
+    except Exception as e:
+        return _mark_unclustered(store, new_note_ids, f"get_inbox failed: {e}")
+    new_pairs = [(r["note_id"], (r.get("title") or "").strip()) for r in new_rows if r]
+    new_pairs = [(nid, t) for nid, t in new_pairs if t]
+    if not new_pairs:
+        # No usable titles → leave them where they are (likely already pending/no cluster).
+        return {"assigned": 0, "unclustered": 0, "reason": "no titles to embed"}
+
+    # 4) Batch-embed centroid sources + new titles.
+    try:
+        flat: list[str] = []
+        spans: list[tuple[int, int]] = []
+        for _cid, titles in cluster_titles:
+            start = len(flat)
+            flat.extend(titles)
+            spans.append((start, len(flat)))
+        new_start = len(flat)
+        flat.extend(t for _nid, t in new_pairs)
+        all_vecs = embed.embed(flat) if flat else []
+        centroids = [_centroid(all_vecs[s:e]) for s, e in spans if e > s]
+        valid_cluster_ids = [cid for (cid, _t), (s, e) in zip(cluster_titles, spans) if e > s]
+        new_vecs = all_vecs[new_start:]
+    except Exception as e:
+        return _mark_unclustered(store, [nid for nid, _ in new_pairs], f"embedding failed: {e}")
+
+    if not centroids:
+        return _mark_unclustered(store, [nid for nid, _ in new_pairs], "no usable centroids")
+
+    # 5) Nearest-centroid assignment with confidence threshold.
+    by_cluster: dict[str, list[str]] = {}
+    unclustered_ids: list[str] = []
+    for (nid, _title), vec in zip(new_pairs, new_vecs):
+        if not vec:
+            unclustered_ids.append(nid)
+            continue
+        best_idx, best_score = -1, -2.0
+        for idx, centroid in enumerate(centroids):
+            score = _cosine(vec, centroid)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        if best_idx < 0 or best_score < min_similarity:
+            unclustered_ids.append(nid)
+        else:
+            by_cluster.setdefault(valid_cluster_ids[best_idx], []).append(nid)
+
+    # 6) Persist.
+    assigned = 0
+    for cid, ids in by_cluster.items():
+        try:
+            store.set_inbox_cluster(ids, cid)
+            assigned += len(ids)
+            # Refresh count on the affected cluster row.
+            existing_meta = next((c for c in existing if c["id"] == cid), None)
+            if existing_meta is not None:
+                try:
+                    store.upsert_cluster({  # type: ignore[attr-defined]
+                        "id": cid,
+                        "name": existing_meta.get("name") or cid,
+                        "description": existing_meta.get("description"),
+                    })
+                except Exception:
+                    pass
+        except Exception:
+            unclustered_ids.extend(ids)
+            assigned -= 0  # nothing to undo, just route to fallback
+
+    if unclustered_ids:
+        _mark_unclustered(store, unclustered_ids, "low confidence or assignment error")
+
+    out: dict[str, Any] = {"assigned": assigned, "unclustered": len(unclustered_ids)}
+    if by_cluster:
+        out["by_cluster"] = {cid: len(ids) for cid, ids in by_cluster.items()}
+    return out
