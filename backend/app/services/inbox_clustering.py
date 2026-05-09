@@ -133,6 +133,19 @@ def cluster_inbox(
     llm = get_llm_provider()
     proposed = llm.cluster_titles(sample_titles, target_clusters=target_clusters)
 
+    # CRITICAL: never proceed with an empty proposal. If the LLM (or its
+    # fallback) returned nothing, replace_clusters([]) below would wipe the
+    # cluster table AND cascade-delete every note_cluster_tags row, leaving
+    # the user with no tags at all. Bail out early so existing assignments
+    # are preserved.
+    if not proposed:
+        return ClusterRunResult(
+            clusters=[],
+            assigned=0,
+            skipped=len(rows),
+            duration_s=time.time() - t0,
+        )
+
     # Make sure every cluster has an id; LLM impl should already, but defend.
     for c in proposed:
         c.setdefault("id", uuid.uuid4().hex[:8])

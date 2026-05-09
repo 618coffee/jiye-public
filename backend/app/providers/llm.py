@@ -450,8 +450,9 @@ class AzureOpenAILLMProvider(LLMProvider):
             data = _parse_json_lenient(content)
             # _parse_json_lenient returns dict; for arrays we need to handle wrapping
             if isinstance(data, dict):
-                # Some models wrap in {"clusters": [...]}; try to unwrap
-                for k in ("clusters", "groups", "categories", "data"):
+                # Some models wrap in {"clusters": [...]}; try to unwrap.
+                # Azure model-router in json_mode often wraps as {"array": [...]}.
+                for k in ("clusters", "groups", "categories", "data", "array", "items", "result"):
                     if isinstance(data.get(k), list):
                         data = data[k]
                         break
