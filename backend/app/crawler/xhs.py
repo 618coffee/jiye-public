@@ -326,6 +326,41 @@ class XhsCollectionCrawler:
         # Give the SPA a moment to swap feeds.
         await asyncio.sleep(1.2)
 
+    async def _refresh_to_top(self, page: Page) -> None:
+        """Force a fresh load of the collection feed and scroll back to top.
+
+        Why: xhs is a SPA — once you've scrolled down, the rendered DOM keeps
+        the previous feed cached, and newly-favorited notes saved while the
+        tab was idle won't appear until the user manually pulls to refresh.
+        Reloading the page is the simplest way to guarantee we see the
+        latest state (this is what MediaCrawler does every run).
+
+        Never raises — if reload or scroll fails, we fall through and let
+        the DOM probe deal with whatever's currently rendered.
+        """
+        try:
+            await page.evaluate("window.scrollTo({ top: 0, behavior: 'instant' })")
+        except Exception:
+            pass
+        try:
+            # reload() preserves the URL (good — keeps any tab=fav&subTab=note)
+            # and bypasses the SPA route cache that page.goto() to the same URL
+            # would happily skip.
+            await page.reload(wait_until="domcontentloaded")
+        except Exception as e:
+            if self.config.debug_dom:
+                print(f"[crawler] reload failed (continuing anyway): {e}")
+            return
+        # After reload, xhs may land on the 笔记 tab again — re-click 收藏.
+        await self._ensure_collection_tab(page)
+        # Make sure we start the scroll loop from the very top.
+        try:
+            await page.evaluate("window.scrollTo({ top: 0, behavior: 'instant' })")
+        except Exception:
+            pass
+        # Brief pause so the masonry layout has time to render the first row.
+        await asyncio.sleep(0.6)
+
     async def scan(
         self,
         *,
@@ -359,6 +394,13 @@ class XhsCollectionCrawler:
             # the URL says /user/profile/<uid>, we may still be on 笔记. Click
             # 收藏 to force the right feed before we start probing.
             await self._ensure_collection_tab(page)
+
+            # Force-refresh the feed and scroll to top so newly-favorited
+            # notes (saved while this tab was idle) actually show up. xhs's
+            # client-side router caches the previous feed; reload + scroll-0
+            # is the cheapest way to invalidate it (mirrors MediaCrawler's
+            # navigate-fresh-each-run pattern).
+            await self._refresh_to_top(page)
 
             # Initial probe so we know the renderer is live.
             try:
