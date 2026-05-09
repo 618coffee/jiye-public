@@ -121,6 +121,48 @@ class AzureOpenAIEmbeddingProvider(EmbeddingProvider):
             return self._fallback.embed(texts)
 
 
+class LocalE5SmallProvider(EmbeddingProvider):
+    """sentence-transformers ``intfloat/multilingual-e5-small`` (384-d).
+
+    First call downloads ~120 MB of model weights to ``~/.cache/huggingface``
+    (set ``HF_ENDPOINT=https://hf-mirror.com`` if you're in mainland China).
+    Subsequent calls hit the in-process model instance.
+
+    Per the e5 paper, queries should be prefixed with ``"query: "`` and corpus
+    documents with ``"passage: "``. We default to ``passage:`` because
+    embeddings are produced for stored chunks; the search-time query goes
+    through :meth:`embed_query`.
+    """
+
+    dim = 384
+
+    def __init__(self, model_name: str = "intfloat/multilingual-e5-small"):
+        self._model_name = model_name
+        self._model = None
+
+    def _load(self):
+        if self._model is None:
+            import os
+            # Auto-fallback to HF mirror if not explicitly set, since the
+            # primary endpoint is frequently unreachable from CN networks.
+            if not os.environ.get("HF_ENDPOINT") and not os.environ.get("HF_HUB_OFFLINE"):
+                os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+            from sentence_transformers import SentenceTransformer
+            self._model = SentenceTransformer(self._model_name)
+        return self._model
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        m = self._load()
+        prefixed = [f"passage: {t}" for t in texts]
+        vecs = m.encode(prefixed, normalize_embeddings=True, show_progress_bar=False)
+        return [v.tolist() for v in vecs]
+
+    def embed_query(self, text: str) -> list[float]:
+        m = self._load()
+        v = m.encode([f"query: {text}"], normalize_embeddings=True, show_progress_bar=False)[0]
+        return v.tolist()
+
+
 _singleton: EmbeddingProvider | None = None
 
 
@@ -130,6 +172,10 @@ def get_embedding_provider() -> EmbeddingProvider:
         return _singleton
     if settings.use_mock == "true":
         _singleton = MockEmbeddingProvider()
+    elif settings.embedding_provider == "local" or (
+        settings.embedding_provider == "auto" and _local_available()
+    ):
+        _singleton = LocalE5SmallProvider()
     elif settings.has_azure_openai and settings.azure_openai_embedding_deployment.strip() and settings.azure_openai_embedding_deployment.strip().lower() != "mock":
         _singleton = AzureOpenAIEmbeddingProvider(
             settings.azure_openai_endpoint,
@@ -142,3 +188,11 @@ def get_embedding_provider() -> EmbeddingProvider:
     else:
         _singleton = MockEmbeddingProvider()
     return _singleton
+
+
+def _local_available() -> bool:
+    try:
+        import importlib.util
+        return importlib.util.find_spec("sentence_transformers") is not None
+    except Exception:
+        return False

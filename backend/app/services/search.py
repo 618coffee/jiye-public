@@ -12,7 +12,11 @@ def hybrid_search(store: SqliteStore, query: str, *, limit: int = 20, city: str 
     llm = get_llm_provider()
 
     fts_hits = store.search(query, limit=limit, city=city)
-    qvec = embed.embed([query])[0]
+    # Use embed_query when the provider distinguishes (e5 prefixes 'query:')
+    if hasattr(embed, "embed_query"):
+        qvec = embed.embed_query(query)
+    else:
+        qvec = embed.embed([query])[0]
     vec_hits = store.vector_search(qvec, limit=limit, city=city)
 
     merged: dict[str, dict[str, Any]] = {}

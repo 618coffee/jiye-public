@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     ocr_enabled: bool = True
     thumbnail_width: int = 320
 
+    # Embedding provider selection: "auto" prefers local e5-small if installed,
+    # otherwise Azure → Qwen → Mock. "local" forces e5-small. "azure"/"qwen"/"mock"
+    # force a specific provider.
+    embedding_provider: str = "auto"
+
     @property
     def has_azure_openai(self) -> bool:
         return bool(self.azure_openai_endpoint and self.azure_openai_api_key)
