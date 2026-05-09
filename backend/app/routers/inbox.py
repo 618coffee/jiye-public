@@ -179,13 +179,7 @@ async def scan_collection(
     Requires a Chrome instance launched with --remote-debugging-port=<cdp>
     and already logged into xiaohongshu.com. Returns inserted/updated counts.
     """
-    target_url = (payload.get("url") or settings.xhs_collection_url or "").strip()
-    if not target_url:
-        raise HTTPException(
-            400,
-            "no collection URL configured. Pass body.url or set "
-            "XHS_COLLECTION_URL env var.",
-        )
+    target_url = (payload.get("url") or settings.xhs_collection_url or "").strip() or None
     cfg = CrawlerConfig(
         cdp_endpoint=str(payload.get("cdp") or settings.xhs_cdp_endpoint),
         max_idle_scrolls=int(payload.get("idle") or 4),

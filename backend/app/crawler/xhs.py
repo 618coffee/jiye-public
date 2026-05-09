@@ -37,6 +37,12 @@ COLLECTION_URL_HINTS = (
     "/board/",              # 专辑/合集页
     "fav",                  # last-resort, also matches ?type=fav etc.
 )
+# Match a profile URL so we can auto-append ?tab=fav&subTab=note when the user
+# only has their own profile page open (no explicit collection URL configured).
+PROFILE_URL_RE = re.compile(
+    r"^(https?://(?:www\.)?xiaohongshu\.com/user/profile/[^/?#]+)",
+    re.IGNORECASE,
+)
 # Note links rendered on the collection page look like:
 #   /explore/<note_id>?xsec_token=xxx&xsec_source=pc_collect
 NOTE_HREF_RE = re.compile(r"/(?:explore|discovery/item)/([0-9a-f]{18,32})", re.IGNORECASE)
@@ -176,6 +182,13 @@ class XhsCollectionCrawler:
     async def _find_xhs_page(self, browser: Browser, *, target_url: str | None = None) -> Page:
         """Pick the collection tab; raise if none. If target_url is given,
         navigate the chosen tab there first.
+
+        When target_url is None, we try in order:
+          1. an existing tab whose URL already looks like a collection feed
+          2. an existing /user/profile/<uid> tab — we auto-append
+             ?tab=fav&subTab=note to land on 收藏 directly
+          3. any xhs tab — we read the logged-in uid from cookies/DOM and
+             build the profile URL ourselves
         """
         candidates: list[Page] = []
         for ctx in browser.contexts:
@@ -199,23 +212,58 @@ class XhsCollectionCrawler:
             await page.goto(target_url, wait_until="domcontentloaded")
             return page
 
-        # Otherwise we MUST find a tab that looks like a collection feed.
-        # Generic "xiaohongshu.com" or homepage "/" are explicitly rejected to
-        # avoid crawling the 推荐 (recommendation) feed by mistake.
+        # 1) Already on a collection-feed-looking page? Use it as-is.
         for p in candidates:
             url_lower = (p.url or "").lower()
-            if any(hint in url_lower for hint in COLLECTION_URL_HINTS):
+            if any(hint in url_lower for hint in COLLECTION_URL_HINTS) and (
+                "tab=fav" in url_lower or "subtab=note" in url_lower
+            ):
                 return p
 
-        # No collection-like tab found — list what we did see, so the user
-        # knows which tab needs adjustment.
+        # 2) Bare /user/profile/<uid> — rewrite to collection URL and goto.
+        for p in candidates:
+            m = PROFILE_URL_RE.match(p.url or "")
+            if m:
+                col_url = m.group(1) + "?tab=fav&subTab=note"
+                if self.config.debug_dom:
+                    print(f"[crawler] auto-deriving collection URL from profile tab: {col_url}")
+                await p.goto(col_url, wait_until="domcontentloaded")
+                return p
+
+        # 3) Last resort — try to discover the logged-in uid from the first xhs
+        # tab's DOM (header avatar link to /user/profile/<uid>) and navigate.
+        page = candidates[0]
+        try:
+            uid = await page.evaluate(
+                """
+                () => {
+                  const a = Array.from(document.querySelectorAll('a[href*="/user/profile/"]'));
+                  for (const el of a) {
+                    const m = (el.getAttribute('href') || '').match(/\\/user\\/profile\\/([^/?#]+)/);
+                    if (m) return m[1];
+                  }
+                  return null;
+                }
+                """
+            )
+        except Exception:
+            uid = None
+        if uid:
+            col_url = f"https://www.xiaohongshu.com/user/profile/{uid}?tab=fav&subTab=note"
+            if self.config.debug_dom:
+                print(f"[crawler] auto-derived uid={uid}, navigating to {col_url}")
+            await page.goto(col_url, wait_until="domcontentloaded")
+            return page
+
+        # No collection-like tab found and we couldn't auto-derive — list what
+        # we did see so the user knows what to fix.
         seen = "\n  - ".join(p.url for p in candidates)
         raise CrawlerError(
-            "Found xiaohongshu tabs but none look like a 收藏 page. "
+            "Could not auto-locate your xhs collection page. "
             "Either:\n"
-            "  (a) navigate one of the tabs to your profile -> 收藏 tab "
-            "(URL should contain 'tabName=collect' or similar), then re-run; or\n"
-            "  (b) re-run with --url <full collection URL>.\n"
+            "  (a) navigate one of your xhs tabs to your profile (the page that "
+            "shows your nickname + avatar), then re-run; or\n"
+            "  (b) set XHS_COLLECTION_URL in backend/.env to your full collection URL.\n"
             f"Tabs seen:\n  - {seen}"
         )
 
