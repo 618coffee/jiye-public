@@ -105,8 +105,45 @@ def main(argv: list[str] | None = None) -> int:
                    help="Optional: navigate the chosen tab to this URL before "
                         "crawling (use your full collection page URL)")
 
+    pp = sub.add_parser(
+        "promote",
+        help="Run the detail-crawl + LLM ingest pipeline for one or more inbox rows",
+    )
+    pp.add_argument("note_ids", nargs="+",
+                    help="One or more inbox note_ids to promote")
+    pp.add_argument("--cdp", default="http://127.0.0.1:9222")
+    pp.add_argument("--max", type=int, default=20,
+                    help="Cap per invocation (default 20, hard max 50)")
+    pp.add_argument("--debug", action="store_true",
+                    help="Print detail-page DOM probe debug info")
+
     args = parser.parse_args(argv)
+    if args.cmd == "promote":
+        return cmd_promote(args)
     return asyncio.run(cmd_scan_inbox(args))
+
+
+def cmd_promote(args: argparse.Namespace) -> int:
+    from ..services.inbox_promote import promote_notes
+    store = SqliteStore(settings.db_path)
+    store.init_schema()
+    res = promote_notes(
+        store,
+        args.note_ids,
+        max_per_request=args.max,
+        cdp_endpoint=args.cdp,
+        debug_dom=args.debug,
+    )
+    print(f"[promote] done in {res.duration_s:.1f}s — "
+          f"promoted={res.promoted} failed={res.failed} skipped={res.skipped}")
+    for r in res.results:
+        marker = {"promoted": "✓", "failed": "✗", "skipped": "·"}.get(r.status, "?")
+        title = (r.title or "")[:60]
+        line = f"  {marker} {r.status:9s}  {r.note_id}  {title}"
+        if r.error:
+            line += f"\n      error: {r.error}"
+        print(line)
+    return 0 if res.failed == 0 else 1
 
 
 if __name__ == "__main__":

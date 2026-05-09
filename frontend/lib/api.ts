@@ -137,6 +137,21 @@ export interface InboxClusterRunResult {
   em_moves?: number;
 }
 
+export interface InboxPromoteOutcome {
+  note_id: string;
+  status: 'promoted' | 'failed' | 'skipped';
+  error?: string | null;
+  title?: string | null;
+}
+
+export interface InboxPromoteResult {
+  results: InboxPromoteOutcome[];
+  promoted: number;
+  failed: number;
+  skipped: number;
+  duration_s: number;
+}
+
 // Server-side (RSC) needs absolute URL pointing at the backend.
 // Client-side uses same-origin via next.config rewrites.
 const BASE = typeof window === 'undefined'
@@ -191,4 +206,9 @@ export const api = {
     postJson<InboxClusterRunResult>('/api/inbox/cluster', body),
   inboxDiscard: (note_ids: string[]) =>
     postJson<{ discarded: number }>('/api/inbox/discard', { note_ids }),
+  inboxPromote: (note_ids: string[], max_per_request?: number) =>
+    postJson<InboxPromoteResult>('/api/inbox/promote',
+      max_per_request !== undefined
+        ? { note_ids, max_per_request }
+        : { note_ids }),
 };

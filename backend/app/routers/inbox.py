@@ -6,6 +6,11 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 
 from ..services.inbox_clustering import cluster_inbox
+from ..services.inbox_promote import (
+    DEFAULT_MAX_PER_REQUEST,
+    HARD_MAX_PER_REQUEST,
+    promote_notes,
+)
 from ..store.sqlite_store import SqliteStore
 
 router = APIRouter(prefix="/api/inbox", tags=["inbox"])
@@ -99,3 +104,51 @@ def discard(
         raise HTTPException(400, "note_ids (non-empty list) required")
     store.set_inbox_status(note_ids, "discarded")
     return {"discarded": len(note_ids)}
+
+
+@router.post("/promote")
+def promote(
+    payload: dict[str, Any] = Body(...),
+    store: SqliteStore = Depends(get_store),
+) -> dict[str, Any]:
+    """Run the detail-crawl + LLM ingest pipeline for the given inbox rows.
+
+    Body:
+      - note_ids:       list[str]    required, non-empty
+      - max_per_request:int          optional, default 20, hard cap 50
+
+    Response:
+      - results:    list[{note_id, status, error?, title?}]
+      - promoted:   int
+      - failed:     int
+      - skipped:    int   (over-cap entries; resubmit to continue)
+      - duration_s: float
+    """
+    note_ids = payload.get("note_ids") or []
+    if not isinstance(note_ids, list) or not note_ids:
+        raise HTTPException(400, "note_ids (non-empty list) required")
+    if not all(isinstance(x, str) and x for x in note_ids):
+        raise HTTPException(400, "note_ids must be a list of non-empty strings")
+
+    max_per = int(payload.get("max_per_request") or DEFAULT_MAX_PER_REQUEST)
+    if max_per < 1 or max_per > HARD_MAX_PER_REQUEST:
+        raise HTTPException(
+            400, f"max_per_request must be in [1, {HARD_MAX_PER_REQUEST}]"
+        )
+
+    res = promote_notes(store, note_ids, max_per_request=max_per)
+    return {
+        "results": [
+            {
+                "note_id": r.note_id,
+                "status": r.status,
+                "error": r.error,
+                "title": r.title,
+            }
+            for r in res.results
+        ],
+        "promoted": res.promoted,
+        "failed": res.failed,
+        "skipped": res.skipped,
+        "duration_s": round(res.duration_s, 2),
+    }

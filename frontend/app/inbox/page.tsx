@@ -12,6 +12,8 @@ import {
   Square,
   Loader2,
   Sparkles,
+  ArrowUpCircle,
+  AlertTriangle,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Card } from '@/components/ui/Card';
@@ -26,6 +28,7 @@ import {
   type InboxCluster,
   type InboxStats,
   type InboxClusterRunResult,
+  type InboxPromoteResult,
 } from '@/lib/api';
 
 type StatusFilter = 'pending' | 'discarded' | 'promoted' | 'all';
@@ -74,6 +77,10 @@ export default function InboxPage() {
   const [reclusterOpen, setReclusterOpen] = useState(false);
   const [reclusterRunning, setReclusterRunning] = useState(false);
   const [lastRun, setLastRun] = useState<InboxClusterRunResult | null>(null);
+
+  const [promoting, setPromoting] = useState(false);
+  const [promoteProgress, setPromoteProgress] = useState<{ done: number; total: number } | null>(null);
+  const [lastPromote, setLastPromote] = useState<InboxPromoteResult | null>(null);
 
   // Initial + after-discard stats refresh
   async function loadStats() {
@@ -145,6 +152,60 @@ export default function InboxPage() {
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : '丢弃失败';
       setError(msg);
+    }
+  }
+
+  // Server hard-caps per request; we chunk and show progress.
+  const PROMOTE_CHUNK = 10;
+
+  async function promoteSelected() {
+    if (selected.size === 0 || promoting) return;
+    const ids = [...selected];
+    if (!confirm(
+      `确认把这 ${ids.length} 条加工进知识库？\n\n` +
+      `每条会自动打开详情页 → LLM 摘要 → 抽取 POI → 写入主库。` +
+      `预计每条 5-10 秒，期间请保持小红书 Chrome 标签页打开且已登录。`
+    )) return;
+
+    setPromoting(true);
+    setError(null);
+    setLastPromote(null);
+    setPromoteProgress({ done: 0, total: ids.length });
+
+    const aggregate: InboxPromoteResult = {
+      results: [], promoted: 0, failed: 0, skipped: 0, duration_s: 0,
+    };
+    try {
+      for (let i = 0; i < ids.length; i += PROMOTE_CHUNK) {
+        const slice = ids.slice(i, i + PROMOTE_CHUNK);
+        const r = await api.inboxPromote(slice, PROMOTE_CHUNK);
+        aggregate.results.push(...r.results);
+        aggregate.promoted += r.promoted;
+        aggregate.failed += r.failed;
+        aggregate.skipped += r.skipped;
+        aggregate.duration_s += r.duration_s;
+        // Optimistic: remove successfully promoted items from the list.
+        const promotedIds = new Set(
+          r.results.filter((o) => o.status === 'promoted').map((o) => o.note_id)
+        );
+        if (promotedIds.size) {
+          setItems((prev) => prev.filter((it) => !promotedIds.has(it.note_id)));
+          setSelected((prev) => {
+            const next = new Set(prev);
+            promotedIds.forEach((id) => next.delete(id));
+            return next;
+          });
+        }
+        setPromoteProgress({ done: Math.min(i + slice.length, ids.length), total: ids.length });
+      }
+      setLastPromote(aggregate);
+      await loadStats();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : '升级失败';
+      setError(msg);
+    } finally {
+      setPromoting(false);
+      setPromoteProgress(null);
     }
   }
 
@@ -344,8 +405,23 @@ export default function InboxPage() {
                     取消
                   </button>
                   <button
+                    onClick={promoteSelected}
+                    disabled={promoting}
+                    className="text-xs px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-600 disabled:opacity-60 disabled:cursor-not-allowed transition inline-flex items-center gap-1.5 font-medium"
+                  >
+                    {promoting ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <ArrowUpCircle className="w-3.5 h-3.5" />
+                    )}
+                    {promoting && promoteProgress
+                      ? `升级中 ${promoteProgress.done}/${promoteProgress.total}`
+                      : '升级到主库'}
+                  </button>
+                  <button
                     onClick={discardSelected}
-                    className="text-xs px-3 py-1.5 rounded-lg bg-rose-500 hover:bg-rose-600 transition inline-flex items-center gap-1.5 font-medium"
+                    disabled={promoting}
+                    className="text-xs px-3 py-1.5 rounded-lg bg-rose-500 hover:bg-rose-600 disabled:opacity-60 disabled:cursor-not-allowed transition inline-flex items-center gap-1.5 font-medium"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                     丢弃
@@ -359,6 +435,46 @@ export default function InboxPage() {
           {error && (
             <Card className="p-4 border-rose-200 bg-rose-50/80 text-rose-700 text-sm">
               {error}
+            </Card>
+          )}
+
+          {/* Promote result banner */}
+          {lastPromote && (
+            <Card className="p-4 border-emerald-200 bg-emerald-50/80 text-sm">
+              <div className="flex items-center gap-2 text-emerald-800 font-medium mb-1">
+                <ArrowUpCircle className="w-4 h-4" />
+                <span>
+                  升级完成：成功 {lastPromote.promoted} · 失败 {lastPromote.failed}
+                  {lastPromote.skipped ? ` · 跳过 ${lastPromote.skipped}` : ''}
+                  · 用时 {lastPromote.duration_s.toFixed(1)}s
+                </span>
+                <button
+                  onClick={() => setLastPromote(null)}
+                  className="ml-auto p-1 rounded hover:bg-emerald-100 text-emerald-700"
+                  aria-label="关闭"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+              {lastPromote.failed > 0 && (
+                <details className="mt-2">
+                  <summary className="cursor-pointer text-rose-700 inline-flex items-center gap-1.5">
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    查看失败明细（{lastPromote.failed}）
+                  </summary>
+                  <ul className="mt-2 space-y-1 text-xs text-rose-700/90 max-h-48 overflow-auto">
+                    {lastPromote.results
+                      .filter((r) => r.status === 'failed')
+                      .map((r) => (
+                        <li key={r.note_id} className="font-mono">
+                          <span className="text-rose-900">{r.note_id}</span>
+                          {r.title ? <span className="text-ink-600"> · {r.title}</span> : null}
+                          {r.error ? <span className="text-rose-600"> — {r.error}</span> : null}
+                        </li>
+                      ))}
+                  </ul>
+                </details>
+              )}
             </Card>
           )}
 
