@@ -203,5 +203,6 @@ def _sample_notes() -> list[dict[str, Any]]:
 def seed(store: KnowledgeStore) -> int:
     notes = _sample_notes()
     for n in notes:
+        n.setdefault("source", "seed")
         ingest_note(store, n)
     return len(notes)

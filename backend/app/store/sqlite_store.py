@@ -94,6 +94,36 @@ CREATE TABLE IF NOT EXISTS city_workbench_cache (
   notes_signature TEXT,
   created_at    TEXT NOT NULL
 );
+
+-- ----------------------------------------------------------------------
+-- Inbox: lightweight rows captured during list-only crawl.  A row sits
+-- here until the user either promotes it (-> notes via full ingest) or
+-- discards it (soft delete, never re-prompt on next crawl).
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS note_inbox (
+  note_id        TEXT PRIMARY KEY,
+  url            TEXT NOT NULL,
+  title          TEXT,
+  cover_url      TEXT,
+  author         TEXT,
+  saved_at       TEXT,             -- xhs collection time (best effort)
+  discovered_at  TEXT NOT NULL,    -- when WE first saw it
+  status         TEXT NOT NULL,    -- pending | processing | promoted | discarded | failed
+  cluster_id     TEXT,
+  raw_meta       TEXT,             -- JSON: anything else the crawler grabbed
+  last_error     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_inbox_status ON note_inbox(status);
+CREATE INDEX IF NOT EXISTS idx_inbox_cluster ON note_inbox(cluster_id);
+CREATE INDEX IF NOT EXISTS idx_inbox_saved_at ON note_inbox(saved_at DESC);
+
+CREATE TABLE IF NOT EXISTS inbox_clusters (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  description  TEXT,
+  count        INTEGER DEFAULT 0,
+  created_at   TEXT NOT NULL
+);
 """
 
 
@@ -138,6 +168,9 @@ class SqliteStore(KnowledgeStore):
             for col in ("image_thumbnails", "image_ocr_texts"):
                 if col not in cols:
                     c.execute(f"ALTER TABLE notes ADD COLUMN {col} TEXT")
+            if "source" not in cols:
+                # Tag where each note came from: seed | crawler | share | manual
+                c.execute("ALTER TABLE notes ADD COLUMN source TEXT DEFAULT 'seed'")
 
     # ---------- writes ----------
 
@@ -148,13 +181,14 @@ class SqliteStore(KnowledgeStore):
                 INSERT INTO notes (id, url, title, body, author, cover, published_at,
                   saved_at, image_paths, image_thumbnails, image_ocr_texts,
                   primary_city, primary_country, city_confidence,
-                  trip_purpose, image_index_level, ai_summary)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  trip_purpose, image_index_level, ai_summary, source)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                   title=excluded.title, body=excluded.body, ai_summary=excluded.ai_summary,
                   image_thumbnails=excluded.image_thumbnails, image_ocr_texts=excluded.image_ocr_texts,
                   primary_city=excluded.primary_city, primary_country=excluded.primary_country,
-                  trip_purpose=excluded.trip_purpose, image_index_level=excluded.image_index_level
+                  trip_purpose=excluded.trip_purpose, image_index_level=excluded.image_index_level,
+                  source=COALESCE(excluded.source, notes.source)
                 """,
                 (
                     note["id"], note.get("url"), note.get("title", ""), note.get("body", ""),
@@ -167,6 +201,7 @@ class SqliteStore(KnowledgeStore):
                     json.dumps(note.get("trip_purpose", []), ensure_ascii=False),
                     note.get("image_index_level", 1),
                     note.get("ai_summary"),
+                    note.get("source"),
                 ),
             )
             # Replace chunks
@@ -491,3 +526,208 @@ class SqliteStore(KnowledgeStore):
                 (city, fresh_window_days),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---------- inbox ----------
+
+    def upsert_inbox(self, item: dict[str, Any]) -> str:
+        """Insert or update a single inbox row.
+
+        ``item`` keys: note_id, url, title, cover_url, author, saved_at, raw_meta
+        New rows default to status='pending'. Existing rows preserve their
+        status (e.g. 'discarded' / 'promoted' is sticky across re-crawls).
+        """
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO note_inbox
+                   (note_id, url, title, cover_url, author, saved_at,
+                    discovered_at, status, raw_meta)
+                   VALUES (?,?,?,?,?,?,?,'pending',?)
+                   ON CONFLICT(note_id) DO UPDATE SET
+                     url=excluded.url,
+                     title=COALESCE(excluded.title, note_inbox.title),
+                     cover_url=COALESCE(excluded.cover_url, note_inbox.cover_url),
+                     author=COALESCE(excluded.author, note_inbox.author),
+                     saved_at=COALESCE(excluded.saved_at, note_inbox.saved_at),
+                     raw_meta=COALESCE(excluded.raw_meta, note_inbox.raw_meta)
+                """,
+                (
+                    item["note_id"], item["url"], item.get("title"),
+                    item.get("cover_url"), item.get("author"), item.get("saved_at"),
+                    now,
+                    json.dumps(item.get("raw_meta") or {}, ensure_ascii=False),
+                ),
+            )
+        return item["note_id"]
+
+    def upsert_inbox_many(self, items: list[dict[str, Any]]) -> dict[str, int]:
+        """Bulk version. Returns {'inserted': N, 'updated': M}."""
+        if not items:
+            return {"inserted": 0, "updated": 0}
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        inserted = 0
+        updated = 0
+        with self._conn() as c:
+            for item in items:
+                row = c.execute(
+                    "SELECT note_id FROM note_inbox WHERE note_id = ?",
+                    (item["note_id"],),
+                ).fetchone()
+                if row:
+                    c.execute(
+                        """UPDATE note_inbox SET
+                             url=?,
+                             title=COALESCE(?, title),
+                             cover_url=COALESCE(?, cover_url),
+                             author=COALESCE(?, author),
+                             saved_at=COALESCE(?, saved_at),
+                             raw_meta=COALESCE(?, raw_meta)
+                           WHERE note_id=?""",
+                        (
+                            item["url"], item.get("title"), item.get("cover_url"),
+                            item.get("author"), item.get("saved_at"),
+                            json.dumps(item.get("raw_meta") or {}, ensure_ascii=False),
+                            item["note_id"],
+                        ),
+                    )
+                    updated += 1
+                else:
+                    c.execute(
+                        """INSERT INTO note_inbox
+                           (note_id, url, title, cover_url, author, saved_at,
+                            discovered_at, status, raw_meta)
+                           VALUES (?,?,?,?,?,?,?,'pending',?)""",
+                        (
+                            item["note_id"], item["url"], item.get("title"),
+                            item.get("cover_url"), item.get("author"), item.get("saved_at"),
+                            now,
+                            json.dumps(item.get("raw_meta") or {}, ensure_ascii=False),
+                        ),
+                    )
+                    inserted += 1
+        return {"inserted": inserted, "updated": updated}
+
+    def list_inbox(
+        self,
+        *,
+        status: str | list[str] | None = "pending",
+        cluster_id: str | None = None,
+        saved_after: str | None = None,
+        saved_before: str | None = None,
+        title_query: str | None = None,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        where: list[str] = []
+        params: list[Any] = []
+        if status:
+            if isinstance(status, str):
+                where.append("status = ?")
+                params.append(status)
+            else:
+                where.append(f"status IN ({','.join('?' * len(status))})")
+                params.extend(status)
+        if cluster_id == "__none__":
+            where.append("cluster_id IS NULL")
+        elif cluster_id:
+            where.append("cluster_id = ?")
+            params.append(cluster_id)
+        if saved_after:
+            where.append("saved_at >= ?")
+            params.append(saved_after)
+        if saved_before:
+            where.append("saved_at <= ?")
+            params.append(saved_before)
+        if title_query:
+            where.append("title LIKE ?")
+            params.append(f"%{title_query}%")
+        sql = "SELECT * FROM note_inbox"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY (saved_at IS NULL), saved_at DESC, discovered_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        with self._conn() as c:
+            rows = c.execute(sql, params).fetchall()
+            return [self._inbox_row_to_dict(r) for r in rows]
+
+    @staticmethod
+    def _inbox_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        if d.get("raw_meta"):
+            try:
+                d["raw_meta"] = json.loads(d["raw_meta"])
+            except Exception:
+                d["raw_meta"] = {}
+        else:
+            d["raw_meta"] = {}
+        return d
+
+    def get_inbox(self, note_id: str) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM note_inbox WHERE note_id = ?", (note_id,)
+            ).fetchone()
+            return self._inbox_row_to_dict(row) if row else None
+
+    def set_inbox_status(
+        self,
+        note_ids: list[str],
+        status: str,
+        *,
+        last_error: str | None = None,
+    ) -> int:
+        if not note_ids:
+            return 0
+        with self._conn() as c:
+            placeholders = ",".join("?" * len(note_ids))
+            c.execute(
+                f"UPDATE note_inbox SET status=?, last_error=? WHERE note_id IN ({placeholders})",
+                [status, last_error, *note_ids],
+            )
+            return c.total_changes
+
+    def set_inbox_cluster(self, note_ids: list[str], cluster_id: str | None) -> int:
+        if not note_ids:
+            return 0
+        with self._conn() as c:
+            placeholders = ",".join("?" * len(note_ids))
+            c.execute(
+                f"UPDATE note_inbox SET cluster_id=? WHERE note_id IN ({placeholders})",
+                [cluster_id, *note_ids],
+            )
+            return c.total_changes
+
+    def inbox_status_counts(self) -> dict[str, int]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT status, COUNT(*) AS n FROM note_inbox GROUP BY status"
+            ).fetchall()
+            return {r["status"]: r["n"] for r in rows}
+
+    def replace_clusters(self, clusters: list[dict[str, Any]]) -> None:
+        """Wipe & rewrite the cluster definitions.
+
+        Each cluster: {id, name, description, count}. Note rows keep their
+        cluster_id pointers; UI is responsible for re-assigning if id changes.
+        """
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as c:
+            c.execute("DELETE FROM inbox_clusters")
+            for cl in clusters:
+                c.execute(
+                    """INSERT INTO inbox_clusters (id, name, description, count, created_at)
+                       VALUES (?,?,?,?,?)""",
+                    (cl["id"], cl["name"], cl.get("description"),
+                     cl.get("count", 0), now),
+                )
+
+    def list_clusters(self) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM inbox_clusters ORDER BY count DESC, name"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
