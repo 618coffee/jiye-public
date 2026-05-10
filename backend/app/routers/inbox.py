@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any
+from collections import Counter
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 
@@ -22,10 +23,29 @@ def get_store(request: Request) -> SqliteStore:
     return request.app.state.store
 
 
+def _detail_tags(item: dict[str, Any]) -> list[str]:
+    meta = item.get("raw_meta") or {}
+    detail = meta.get("detail") if isinstance(meta, dict) else None
+    if not isinstance(detail, dict) or not detail.get("ok"):
+        return []
+    tags = detail.get("tags") or []
+    if not isinstance(tags, list):
+        return []
+    return [str(t).strip() for t in tags if str(t).strip()]
+
+
+def _filter_detail_tags(items: list[dict[str, Any]], tags: list[str]) -> list[dict[str, Any]]:
+    selected = {t.strip() for t in tags if t.strip()}
+    if not selected:
+        return items
+    return [it for it in items if selected.intersection(_detail_tags(it))]
+
+
 @router.get("")
 def list_inbox(
     status: str | None = Query(None),
     cluster_id: str | None = Query(None),
+    detail_tag: list[str] = Query(default=[]),
     saved_after: str | None = Query(None),
     saved_before: str | None = Query(None),
     title_query: str | None = Query(None),
@@ -33,14 +53,17 @@ def list_inbox(
     offset: int = Query(0, ge=0),
     store: SqliteStore = Depends(get_store),
 ) -> dict[str, Any]:
+    tag_filter = [t for t in detail_tag if t]
+    fetch_limit = 10_000 if tag_filter else limit
+    fetch_offset = 0 if tag_filter else offset
     # Explicit cluster filter (not __none__) goes through the multi-tag join
     # so a note tagged with multiple clusters appears under each of them.
     if cluster_id and cluster_id != "__none__":
         items = store.list_inbox_by_cluster_any(
             cluster_id,
             status=status,
-            limit=limit,
-            offset=offset,
+            limit=fetch_limit,
+            offset=fetch_offset,
         )
         # Apply remaining filters in-memory (saved_at / title_query). These
         # are rarely combined with cluster filtering and the result set is
@@ -59,13 +82,17 @@ def list_inbox(
             saved_after=saved_after,
             saved_before=saved_before,
             title_query=title_query,
-            limit=limit,
-            offset=offset,
+            limit=fetch_limit,
+            offset=fetch_offset,
         )
+    if tag_filter:
+        items = _filter_detail_tags(items, tag_filter)
+        items = items[offset: offset + limit]
     if items:
         tags_by_id = store.get_note_tags_bulk([it["note_id"] for it in items])
         for it in items:
             it["tags"] = tags_by_id.get(it["note_id"], [])
+            it["detail_tags"] = _detail_tags(it)
     return {"items": items, "limit": limit, "offset": offset}
 
 
@@ -74,6 +101,23 @@ def stats(store: SqliteStore = Depends(get_store)) -> dict[str, Any]:
     return {
         "by_status": store.inbox_status_counts(),
         "clusters": store.list_clusters(),
+    }
+
+
+@router.get("/detail-tags")
+def detail_tags(
+    status: str | None = Query(None),
+    store: SqliteStore = Depends(get_store),
+) -> dict[str, Any]:
+    items = store.list_inbox(status=status, limit=10_000, offset=0)
+    counts: Counter[str] = Counter()
+    for item in items:
+        counts.update(_detail_tags(item))
+    return {
+        "tags": [
+            {"tag": tag, "count": count}
+            for tag, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
     }
 
 
@@ -87,28 +131,19 @@ def run_clustering(
     payload: dict[str, Any] = Body(default_factory=dict),
     store: SqliteStore = Depends(get_store),
 ) -> dict[str, Any]:
-    target = int(payload.get("target_clusters", 12))
-    sample = int(payload.get("sample_size", 300))
+    """Re-cluster the inbox.
+
+    No tunables exposed to users: the LLM decides the cluster count, and
+    sampling / threshold / EM defaults live in the service module. The
+    only knob still honoured is ``status`` and ``only_unassigned`` (used
+    internally), which are not surfaced in the UI.
+    """
     status = payload.get("status", "pending")
     only_unassigned = bool(payload.get("only_unassigned", False))
-    em_iterations = int(payload.get("em_iterations", 1))
-    min_similarity = float(payload.get("min_similarity", 0.55))
-    if target < 2 or target > 30:
-        raise HTTPException(400, "target_clusters must be in [2, 30]")
-    if sample < 10 or sample > 1000:
-        raise HTTPException(400, "sample_size must be in [10, 1000]")
-    if em_iterations < 0 or em_iterations > 3:
-        raise HTTPException(400, "em_iterations must be in [0, 3]")
-    if min_similarity < 0.0 or min_similarity > 1.0:
-        raise HTTPException(400, "min_similarity must be in [0.0, 1.0]")
     res = cluster_inbox(
         store,
         status=status,
-        target_clusters=target,
-        sample_size=sample,
         only_unassigned=only_unassigned,
-        em_iterations=em_iterations,
-        min_similarity=min_similarity,
     )
     return {
         "clusters": res.clusters,

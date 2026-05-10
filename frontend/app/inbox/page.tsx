@@ -13,7 +13,6 @@ import {
   CheckSquare,
   Square,
   Loader2,
-  Sparkles,
   ArrowUpCircle,
   AlertTriangle,
 } from 'lucide-react';
@@ -31,6 +30,7 @@ import {
   type InboxStats,
   type InboxClusterRunResult,
   type InboxPromoteResult,
+  type InboxDetailTag,
 } from '@/lib/api';
 
 type StatusFilter = 'pending' | 'discarded' | 'promoted' | 'all';
@@ -64,10 +64,11 @@ function useDebounced<T>(value: T, delay = 300): T {
 
 export default function InboxPage() {
   const [stats, setStats] = useState<InboxStats | null>(null);
+  const [detailTags, setDetailTags] = useState<InboxDetailTag[]>([]);
   const [items, setItems] = useState<InboxItem[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [clusterId, setClusterId] = useState<string | null>(null);
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('pending');
+  const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('promoted');
   const [titleQuery, setTitleQuery] = useState('');
   const debouncedQuery = useDebounced(titleQuery, 300);
   const [offset, setOffset] = useState(0);
@@ -76,7 +77,6 @@ export default function InboxPage() {
   const [error, setError] = useState<string | null>(null);
   const [, startTransition] = useTransition();
 
-  const [reclusterOpen, setReclusterOpen] = useState(false);
   const [reclusterRunning, setReclusterRunning] = useState(false);
   const [lastRun, setLastRun] = useState<InboxClusterRunResult | null>(null);
 
@@ -92,6 +92,8 @@ export default function InboxPage() {
     incremental?: boolean;
     auto_cluster?: { assigned: number; unclustered: number; multi_tagged?: number; reason?: string };
   } | null>(null);
+  const selectedTagList = useMemo(() => [...selectedTags].sort(), [selectedTags]);
+  const selectedTagKey = selectedTagList.join('\u0001');
 
   // Initial + after-discard stats refresh
   async function loadStats() {
@@ -104,8 +106,19 @@ export default function InboxPage() {
     }
   }
 
+  async function loadTagStats() {
+    try {
+      const r = await api.inboxDetailTags();
+      setDetailTags(r.tags);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'tag load failed';
+      setError(msg);
+    }
+  }
+
   useEffect(() => {
     loadStats();
+    loadTagStats();
   }, []);
 
   // Load items when filter changes
@@ -114,7 +127,7 @@ export default function InboxPage() {
     setSelected(new Set());
     void loadItems(0, /* append */ false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clusterId, statusFilter, debouncedQuery]);
+  }, [selectedTagKey, statusFilter, debouncedQuery]);
 
   async function loadItems(off: number, append: boolean) {
     setLoading(true);
@@ -122,7 +135,7 @@ export default function InboxPage() {
     try {
       const r = await api.inboxList({
         status: statusFilter === 'all' ? undefined : statusFilter,
-        cluster_id: clusterId ?? undefined,
+        detail_tags: selectedTagList,
         title_query: debouncedQuery.trim() || undefined,
         limit: PAGE_SIZE,
         offset: off,
@@ -160,6 +173,7 @@ export default function InboxPage() {
       setItems((prev) => prev.filter((it) => !selected.has(it.note_id)));
       setSelected(new Set());
       await loadStats();
+      await loadTagStats();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : '丢弃失败';
       setError(msg);
@@ -222,6 +236,7 @@ export default function InboxPage() {
       }
       setLastPromote(aggregate);
       await loadStats();
+      await loadTagStats();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : '升级失败';
       setError(msg);
@@ -255,6 +270,7 @@ export default function InboxPage() {
         auto_cluster: r.auto_cluster,
       });
       await loadStats();
+      await loadTagStats();
       startTransition(() => {
         void loadItems(0, false);
         setOffset(0);
@@ -267,16 +283,13 @@ export default function InboxPage() {
     }
   }
 
-  async function runRecluster(target: number, sample: number, threshold: number, em: number) {
+  async function runRecluster() {
     setReclusterRunning(true);
     setError(null);
     try {
-      const r = await api.inboxRecluster({
-        target_clusters: target,
-        sample_size: sample,
-        min_similarity: threshold,
-        em_iterations: em,
-      });
+      // No tunables: backend + LLM decide cluster count, sampling and
+      // thresholds. Users shouldn't need to know any of that.
+      const r = await api.inboxRecluster({});
       setLastRun(r);
       await loadStats();
       // Refresh current view
@@ -297,17 +310,20 @@ export default function InboxPage() {
   const promotedCount = stats?.by_status?.promoted ?? 0;
   const allClusters = stats?.clusters ?? [];
 
-  // Sorted clusters by count desc
-  const sortedClusters = useMemo(
-    () => [...allClusters].sort((a, b) => b.count - a.count),
-    [allClusters],
-  );
+  const selectedFilterName = useMemo(() => {
+    if (selectedTagList.length === 0) return '全部';
+    if (selectedTagList.length === 1) return `#${selectedTagList[0]}`;
+    return `${selectedTagList.length} 个标签`;
+  }, [selectedTagList]);
 
-  const selectedClusterName = useMemo(() => {
-    if (clusterId === null) return '全部';
-    if (clusterId === '__none__') return '未分类';
-    return allClusters.find((c) => c.id === clusterId)?.name ?? clusterId;
-  }, [clusterId, allClusters]);
+  function toggleDetailTag(tag: string) {
+    setSelectedTags((prev) => {
+      const next = new Set(prev);
+      if (next.has(tag)) next.delete(tag);
+      else next.add(tag);
+      return next;
+    });
+  }
 
   return (
     <div className="space-y-6">
@@ -328,7 +344,7 @@ export default function InboxPage() {
                   <span className="mx-2 text-ink-300">·</span>
                   <span>{promotedCount}</span> 已入库
                   <span className="mx-2 text-ink-300">·</span>
-                  <span>{allClusters.length}</span> 个聚类
+                  <span>{detailTags.length}</span> 个标签
                 </>
               ) : (
                 <span className="text-ink-400">载入中…</span>
@@ -348,61 +364,55 @@ export default function InboxPage() {
           <Button
             variant="soft"
             size="md"
-            onClick={() => setReclusterOpen((v) => !v)}
+            onClick={runRecluster}
+            disabled={reclusterRunning}
+            title="让 AI 重新读一遍你的收藏并重新分类"
           >
-            <RefreshCw className="w-4 h-4" />
-            重新聚类
+            {reclusterRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+            {reclusterRunning ? '聚类中…' : '重新聚类'}
           </Button>
         </div>
 
-        <AnimatePresence initial={false}>
-          {reclusterOpen && (
-            <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.2 }}
-              className="overflow-hidden"
-            >
-              <ReclusterForm
-                running={reclusterRunning}
-                lastRun={lastRun}
-                onSubmit={(t, s, th, em) => runRecluster(t, s, th, em)}
-                onClose={() => setReclusterOpen(false)}
-              />
-            </motion.div>
-          )}
-        </AnimatePresence>
+        {lastRun && (
+          <div className="mt-3 text-xs text-ink-500">
+            上次重新聚类：分配 <b className="text-ink-700">{lastRun.assigned}</b> 条 ·
+            生成 <b className="text-ink-700">{lastRun.clusters?.length ?? 0}</b> 个聚类 ·
+            低置信 <b className="text-ink-700">{lastRun.low_confidence ?? 0}</b> ·
+            多标签 <b className="text-ink-700">{lastRun.multi_tagged ?? 0}</b> ·
+            用时 <b className="text-ink-700">{lastRun.duration_s}s</b>
+          </div>
+        )}
       </Card>
 
       {/* Two-column main */}
       <div className="grid grid-cols-1 lg:grid-cols-[260px_1fr] gap-6">
         {/* Sidebar (desktop) */}
         <aside className="hidden lg:block">
-          <ClusterSidebar
-            clusters={sortedClusters}
-            selectedId={clusterId}
-            onSelect={setClusterId}
-            totalPending={pendingCount}
+          <TagSidebar
+            tags={detailTags}
+            selected={selectedTags}
+            onToggle={toggleDetailTag}
+            onClear={() => setSelectedTags(new Set())}
+            total={promotedCount}
           />
         </aside>
 
-        {/* Mobile cluster chips */}
+        {/* Mobile tag chips */}
         <div className="lg:hidden -mx-4 px-4">
           <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-thin">
             <ClusterChip
               label="全部"
-              count={pendingCount}
-              active={clusterId === null}
-              onClick={() => setClusterId(null)}
+              count={promotedCount}
+              active={selectedTags.size === 0}
+              onClick={() => setSelectedTags(new Set())}
             />
-            {sortedClusters.map((c) => (
+            {detailTags.slice(0, 80).map((t) => (
               <ClusterChip
-                key={c.id}
-                label={c.name}
-                count={c.count}
-                active={clusterId === c.id}
-                onClick={() => setClusterId(c.id)}
+                key={t.tag}
+                label={`#${t.tag}`}
+                count={t.count}
+                active={selectedTags.has(t.tag)}
+                onClick={() => toggleDetailTag(t.tag)}
               />
             ))}
           </div>
@@ -417,7 +427,7 @@ export default function InboxPage() {
               <Input
                 value={titleQuery}
                 onChange={(e) => setTitleQuery(e.target.value)}
-                placeholder={`在「${selectedClusterName}」中搜索标题…`}
+                placeholder={`在「${selectedFilterName}」中搜索标题…`}
                 className="h-9 text-sm border-0 shadow-none focus:ring-0 px-1"
               />
               {titleQuery && (
@@ -595,7 +605,7 @@ export default function InboxPage() {
           {loading && items.length === 0 ? (
             <SkeletonGrid />
           ) : items.length === 0 ? (
-            <EmptyState clusterName={selectedClusterName} />
+            <EmptyState clusterName={selectedFilterName} />
           ) : (
             <>
               <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
@@ -646,6 +656,101 @@ export default function InboxPage() {
 }
 
 // -------------------------- Subcomponents --------------------------
+
+function TagSidebar({
+  tags,
+  selected,
+  onToggle,
+  onClear,
+  total,
+}: {
+  tags: InboxDetailTag[];
+  selected: Set<string>;
+  onToggle: (tag: string) => void;
+  onClear: () => void;
+  total: number;
+}) {
+  const [tagQuery, setTagQuery] = useState('');
+  const visibleTags = useMemo(() => {
+    const q = tagQuery.trim().toLowerCase();
+    return tags
+      .filter((tag) => !q || tag.tag.toLowerCase().includes(q))
+      .sort((a, b) => {
+        const activeDelta = Number(selected.has(b.tag)) - Number(selected.has(a.tag));
+        return activeDelta || b.count - a.count || a.tag.localeCompare(b.tag);
+      });
+  }, [tags, tagQuery, selected]);
+  return (
+    <div className="sticky top-24 max-h-[calc(100vh-7rem)] overflow-y-auto pr-1 space-y-1">
+      <button
+        onClick={onClear}
+        className={cn(
+          'w-full text-left px-3 py-2.5 rounded-xl transition-all border',
+          selected.size === 0
+            ? 'bg-rouge-50/80 border-rouge-200 ring-1 ring-rouge-200/60'
+            : 'bg-transparent border-transparent hover:bg-ink-100/60',
+        )}
+      >
+        <div className="flex items-center gap-2">
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-semibold text-ink-900 line-clamp-1">全部标签</div>
+            <div className="text-[11px] text-ink-400 line-clamp-1 mt-0.5">
+              多选标签时显示任一匹配的收藏
+            </div>
+          </div>
+          <span className={cn(
+            'text-[11px] tabular-nums px-1.5 py-0.5 rounded-md',
+            selected.size === 0 ? 'bg-rouge-100 text-rouge-700' : 'bg-ink-100 text-ink-500',
+          )}>
+            {total}
+          </span>
+        </div>
+      </button>
+      {selected.size > 0 && (
+        <button
+          onClick={onClear}
+          className="w-full text-left px-3 py-2 text-xs rounded-xl text-ink-500 hover:bg-ink-100/60 transition"
+        >
+          清除已选的 {selected.size} 个标签
+        </button>
+      )}
+      <div className="relative py-1">
+        <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-ink-400" />
+        <input
+          value={tagQuery}
+          onChange={(event) => setTagQuery(event.target.value)}
+          placeholder="筛选标签…"
+          className="w-full h-8 rounded-lg border border-ink-200 bg-white pl-8 pr-2 text-xs text-ink-700 placeholder:text-ink-400 focus:outline-none focus:border-rouge-300"
+        />
+      </div>
+      {visibleTags.map((tag) => {
+        const active = selected.has(tag.tag);
+        return (
+          <button
+            key={tag.tag}
+            onClick={() => onToggle(tag.tag)}
+            className={cn(
+              'w-full text-left px-3 py-2 rounded-xl transition-all border',
+              active
+                ? 'bg-ink-900 text-white border-ink-900'
+                : 'bg-transparent border-transparent hover:bg-ink-100/60 text-ink-800',
+            )}
+          >
+            <div className="flex items-center gap-2">
+              <span className="flex-1 min-w-0 text-sm font-medium line-clamp-1">#{tag.tag}</span>
+              <span className={cn(
+                'text-[11px] tabular-nums px-1.5 py-0.5 rounded-md',
+                active ? 'bg-white/15 text-white/80' : 'bg-ink-100 text-ink-500',
+              )}>
+                {tag.count}
+              </span>
+            </div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 function ClusterSidebar({
   clusters,
@@ -876,6 +981,7 @@ function InboxCard({
   const tags = (item.tags ?? []).filter(
     (t) => t.cluster_id !== '__unclustered__' && t.cluster_id !== '__low_conf__',
   );
+  const detailTags = (item.detail_tags ?? []).slice(0, 6);
   const showTagChips = tags.length > 1;
   const clusterName = (cid: string) =>
     clusters.find((c) => c.id === cid)?.name ?? cid;
@@ -946,6 +1052,18 @@ function InboxCard({
             ))}
           </div>
         )}
+        {detailTags.length > 0 && (
+          <div className="flex flex-wrap gap-1 mt-0.5">
+            {detailTags.map((tag) => (
+              <span
+                key={tag}
+                className="inline-flex items-center rounded-full bg-white border border-ink-200 px-1.5 py-[1px] text-[9.5px] leading-tight text-ink-500"
+              >
+                #{tag}
+              </span>
+            ))}
+          </div>
+        )}
         <div className="flex items-center justify-between gap-2 mt-auto pt-1">
           <div className="text-[11px] text-ink-400 line-clamp-1 flex-1 min-w-0">
             {item.author || '匿名'}
@@ -998,127 +1116,5 @@ function EmptyState({ clusterName }: { clusterName: string }) {
       <div className="text-sm">「{clusterName}」中没有匹配的收藏</div>
       <div className="text-xs text-ink-400 mt-1">换个状态、换个聚类，或清空搜索试试</div>
     </Card>
-  );
-}
-
-function ReclusterForm({
-  running,
-  lastRun,
-  onSubmit,
-  onClose,
-}: {
-  running: boolean;
-  lastRun: InboxClusterRunResult | null;
-  onSubmit: (target: number, sample: number, threshold: number, em: number) => void;
-  onClose: () => void;
-}) {
-  const [target, setTarget] = useState(12);
-  const [sample, setSample] = useState(300);
-  const [threshold, setThreshold] = useState(0.55);
-  const [em, setEm] = useState(1);
-
-  return (
-    <div className="mt-4 pt-4 border-t border-ink-200/70">
-      <div className="flex items-center gap-2 text-rouge-600 text-xs font-medium mb-3">
-        <Sparkles className="w-3.5 h-3.5" />
-        重新聚类参数
-      </div>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <FormNumber
-          label="目标簇数"
-          value={target}
-          onChange={setTarget}
-          min={2}
-          max={30}
-          hint="LLM 会输出大致这么多个分类"
-        />
-        <FormNumber
-          label="样本数"
-          value={sample}
-          onChange={setSample}
-          min={10}
-          max={1000}
-          step={50}
-          hint="LLM 看多少标题来定义簇（越大越稳）"
-        />
-        <FormNumber
-          label="EM 迭代"
-          value={em}
-          onChange={setEm}
-          min={0}
-          max={3}
-          hint="0=纯 LLM 中心点，1+=用真实分布修正"
-        />
-        <FormNumber
-          label="低置信阈值"
-          value={threshold}
-          onChange={setThreshold}
-          min={0}
-          max={1}
-          step={0.05}
-          float
-          hint="余弦低于此值进入「低置信度」"
-        />
-      </div>
-
-      <div className="flex items-center gap-3 mt-4">
-        <Button onClick={() => onSubmit(target, sample, threshold, em)} disabled={running} size="md">
-          {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-          {running ? '聚类中…' : '运行'}
-        </Button>
-        <Button variant="ghost" size="md" onClick={onClose} disabled={running}>
-          收起
-        </Button>
-        <div className="flex-1" />
-        {lastRun && (
-          <div className="text-xs text-ink-500">
-            上次：分配 <b className="text-ink-700">{lastRun.assigned}</b> · 低置信{' '}
-            <b className="text-ink-700">{lastRun.low_confidence ?? 0}</b> · EM 移动{' '}
-            <b className="text-ink-700">{lastRun.em_moves ?? 0}</b> · 用时{' '}
-            <b className="text-ink-700">{lastRun.duration_s}s</b>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function FormNumber({
-  label,
-  value,
-  onChange,
-  min,
-  max,
-  step = 1,
-  float,
-  hint,
-}: {
-  label: string;
-  value: number;
-  onChange: (v: number) => void;
-  min: number;
-  max: number;
-  step?: number;
-  float?: boolean;
-  hint?: string;
-}) {
-  return (
-    <label className="flex flex-col gap-1">
-      <span className="text-[11px] text-ink-500">{label}</span>
-      <input
-        type="number"
-        value={value}
-        min={min}
-        max={max}
-        step={step}
-        onChange={(e) => {
-          const raw = e.target.value;
-          const v = float ? parseFloat(raw) : parseInt(raw, 10);
-          if (!isNaN(v)) onChange(Math.max(min, Math.min(max, v)));
-        }}
-        className="h-9 px-2 text-sm rounded-lg border border-ink-200 bg-white focus:outline-none focus:border-rouge-400 tabular-nums"
-      />
-      {hint && <span className="text-[10px] text-ink-400 leading-tight">{hint}</span>}
-    </label>
   );
 }

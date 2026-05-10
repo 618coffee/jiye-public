@@ -33,6 +33,9 @@ Thumbs.db
 .cache/
 models/
 
+# Local diagnostics
+backend/scripts/iter_cluster_last.json
+
 # OCR pipeline cache (regenerated on first seed)
 data/thumb/
 data/raw_seed/

@@ -47,8 +47,87 @@ COUNTRY_FLAGS = {
     "CN": "🇨🇳", "JP": "🇯🇵", "US": "🇺🇸", "FR": "🇫🇷",
     "TH": "🇹🇭", "KR": "🇰🇷", "GB": "🇬🇧", "IT": "🇮🇹",
     "DE": "🇩🇪", "ES": "🇪🇸", "SG": "🇸🇬", "MY": "🇲🇾",
-    "VN": "🇻🇳", "ID": "🇮🇩", "AU": "🇦🇺",
+    "VN": "🇻🇳", "ID": "🇮🇩", "AU": "🇦🇺", "TR": "🇹🇷",
+    "NL": "🇳🇱", "KE": "🇰🇪", "NZ": "🇳🇿",
 }
+
+
+DESTINATION_HINTS: list[tuple[tuple[str, ...], tuple[str, str]]] = [
+    (("川西", "八郎生都", "贡嘎", "雅拉", "四姑娘山", "海螺沟", "双桥沟", "新都桥", "理小路"), ("川西", "CN")),
+    (("卡帕多奇亚", "格雷梅", "Cappadocia"), ("卡帕多奇亚", "TR")),
+    (("冲绳", "Okinawa"), ("冲绳", "JP")),
+    (("拉斯维加斯", "Las Vegas", "Vegas", "Sphere"), ("拉斯维加斯", "US")),
+    (("西雅图", "Seattle", "Stehekin"), ("西雅图", "US")),
+    (("洛杉矶", "Los Angeles", "DTLA", "Hermosa", "Santa Monica"), ("洛杉矶", "US")),
+    (("苏州", "养育巷", "柳巷"), ("苏州", "CN")),
+    (("绍兴", "四明山"), ("绍兴", "CN")),
+    (("White pocket", "羚羊谷", "Arizona", "拱门国家公园", "大峡谷国家公园"), ("美国西南", "US")),
+    (("莫哈韦", "飞机坟场"), ("莫哈韦", "US")),
+    (("荷兰", "阿姆斯特丹", "Netherlands"), ("阿姆斯特丹", "NL")),
+]
+
+
+PLACE_TERMS = [
+    "土耳其", "卡帕多奇亚", "格雷梅", "英国", "荷兰", "欧洲", "日本", "冲绳", "东京", "池袋",
+    "成都", "川西", "海螺沟", "四姑娘山", "双桥沟", "八郎生都", "贡嘎", "雅拉", "理小路", "新都桥",
+    "绍兴", "四明山", "苏州", "养育巷", "柳巷", "佛山", "顺德", "大夫山",
+    "美国", "西雅图", "拉斯维加斯", "夏威夷", "大岛", "Mauna Kea", "UW",
+    "巴厘岛", "Okinawa", "Seattle", "Las Vegas", "Hawaii", "Netherlands", "Turkey",
+]
+
+
+_PLACE_RE = re.compile(
+    "|".join(re.escape(x) for x in sorted(PLACE_TERMS, key=len, reverse=True)),
+    re.I,
+)
+
+
+def _normalise_place(place: str) -> str:
+    aliases = {
+        "seattle": "西雅图",
+        "las vegas": "拉斯维加斯",
+        "hawaii": "夏威夷",
+        "netherlands": "荷兰",
+        "turkey": "土耳其",
+    }
+    return aliases.get(place.lower(), place)
+
+
+def _parse_published_location(text: str | None) -> str | None:
+    if not text:
+        return None
+    match = re.search(
+        r"(?:\d{4}-)?\d{1,2}-\d{1,2}\s+([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z\s]{1,30})$",
+        text.strip(),
+    )
+    if not match:
+        return None
+    location = match.group(1).strip()
+    return None if location.startswith("编辑") else location
+
+
+def extract_place_terms(*texts: str | None, published_at: str | None = None) -> list[str]:
+    places: list[str] = []
+    published_location = _parse_published_location(published_at)
+    if published_location:
+        places.append(published_location)
+    for text in texts:
+        if not text:
+            continue
+        for match in _PLACE_RE.finditer(text):
+            place = _normalise_place(match.group(0))
+            if place not in places:
+                places.append(place)
+    return places[:12]
+
+
+def infer_destination(text: str) -> tuple[str, str] | None:
+    lower = text.lower()
+    for aliases, destination in DESTINATION_HINTS:
+        for alias in aliases:
+            if alias.lower() in lower:
+                return destination
+    return None
 
 
 def country_flag(code: str | None) -> str:
@@ -67,14 +146,26 @@ def ingest_note(store: KnowledgeStore, raw: dict[str, Any]) -> str:
     llm = get_llm_provider()
     embed = get_embedding_provider()
 
-    full_text = "\n".join(filter(None, [raw.get("title"), raw.get("body")]))
+    tags = [str(t).strip() for t in (raw.get("tags") or []) if str(t).strip()]
+    tag_text = " ".join(tags)
+    place_terms = extract_place_terms(
+        raw.get("title"),
+        tag_text,
+        raw.get("body"),
+        published_at=raw.get("published_at"),
+    )
+
+    full_text = "\n".join(filter(None, [raw.get("title"), tag_text, raw.get("body")]))
     extracted = llm.extract_note(full_text)
 
     # Safety net: if LLM didn't pick a city, scan the text for a known alias.
     # Also normalise English aliases (e.g. "Los Angeles" -> "洛杉矶").
     raw_city = (extracted.get("primary_city") or "").strip()
     raw_country = (extracted.get("primary_country") or "").strip().upper()
-    if not raw_city or raw_city.lower() in {"null", "none", "unknown"}:
+    hinted_destination = infer_destination(full_text)
+    if hinted_destination:
+        raw_city, raw_country = hinted_destination
+    elif not raw_city or raw_city.lower() in {"null", "none", "unknown", "未知"}:
         for alias, (cn_city, cn_country) in _CITY_HINTS.items():
             if alias in full_text:
                 raw_city, raw_country = cn_city, cn_country
@@ -90,6 +181,10 @@ def ingest_note(store: KnowledgeStore, raw: dict[str, Any]) -> str:
     chunks: list[dict[str, Any]] = []
     if raw.get("title"):
         chunks.append({"chunk_type": "title", "text": raw["title"]})
+    if tags:
+        chunks.append({"chunk_type": "tags", "text": "标签: " + " ".join(tags)})
+    if place_terms:
+        chunks.append({"chunk_type": "places", "text": "地点: " + " ".join(place_terms)})
     if raw.get("body"):
         for i, para in enumerate(_split_body(raw["body"])):
             chunks.append({"chunk_type": "body", "text": para})

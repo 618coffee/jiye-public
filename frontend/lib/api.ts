@@ -121,6 +121,7 @@ export interface InboxItem {
   raw_meta: Record<string, unknown>;
   last_error: string | null;
   tags?: InboxClusterTag[];
+  detail_tags?: string[];
 }
 
 export interface InboxCluster {
@@ -168,6 +169,11 @@ export interface InboxPromoteResult {
   duration_s: number;
 }
 
+export interface InboxDetailTag {
+  tag: string;
+  count: number;
+}
+
 // Server-side (RSC) needs absolute URL pointing at the backend.
 // Client-side uses same-origin via next.config rewrites.
 const BASE = typeof window === 'undefined'
@@ -209,17 +215,23 @@ export const api = {
   },
   settings: () => get<{ providers: Record<string, string>; data_dir: string; use_mock: string }>('/api/settings'),
   inboxStats: () => get<InboxStats>('/api/inbox/stats'),
-  inboxList: (params: { status?: string; cluster_id?: string; title_query?: string; limit?: number; offset?: number }) => {
+  inboxList: (params: { status?: string; cluster_id?: string; detail_tags?: string[]; title_query?: string; limit?: number; offset?: number }) => {
     const qs = new URLSearchParams();
     if (params.status) qs.set('status', params.status);
     if (params.cluster_id) qs.set('cluster_id', params.cluster_id);
+    if (params.detail_tags) params.detail_tags.forEach((tag) => qs.append('detail_tag', tag));
     if (params.title_query) qs.set('title_query', params.title_query);
     if (params.limit !== undefined) qs.set('limit', String(params.limit));
     if (params.offset !== undefined) qs.set('offset', String(params.offset));
     return get<{ items: InboxItem[]; limit: number; offset: number }>(`/api/inbox?${qs.toString()}`);
   },
-  inboxRecluster: (body: { target_clusters?: number; sample_size?: number; em_iterations?: number; min_similarity?: number }) =>
-    postJson<InboxClusterRunResult>('/api/inbox/cluster', body),
+  inboxDetailTags: (status?: string) => {
+    const qs = new URLSearchParams();
+    if (status) qs.set('status', status);
+    return get<{ tags: InboxDetailTag[] }>(`/api/inbox/detail-tags?${qs.toString()}`);
+  },
+  inboxRecluster: (body?: Record<string, never>) =>
+    postJson<InboxClusterRunResult>('/api/inbox/cluster', body ?? {}),
   inboxDiscard: (note_ids: string[]) =>
     postJson<{ discarded: number }>('/api/inbox/discard', { note_ids }),
   inboxPromote: (note_ids: string[], max_per_request?: number) =>

@@ -203,10 +203,10 @@ _DETAIL_PROBE_JS = r"""
   const hasMultipleImages = images.length >= 2;
   const ok =
     !isQrWall &&
-    !!title &&
     (
-      (modalOpen && (hasBody || !!published_at)) ||
-      (modalOpen && hasMultipleImages && !!author)
+      (modalOpen && hasBody) ||
+      (modalOpen && !!title && !!published_at) ||
+      (modalOpen && !!title && hasMultipleImages && !!author)
     );
 
   return {
@@ -235,12 +235,40 @@ _DETAIL_PROBE_JS = r"""
 _SCROLL_TO_NOTE_JS = r"""
 (noteId) => {
   const a = document.querySelector(
-    `a[href*="/explore/${noteId}"], a[href*="/discovery/item/${noteId}"]`
+    `a[href*="/${noteId}?xsec_token="], ` +
+    `a[href*="/explore/${noteId}"], ` +
+    `a[href*="/discovery/item/${noteId}"]`
   );
   if (!a) return { found: false };
   a.scrollIntoView({ block: 'center', behavior: 'instant' });
   const rect = a.getBoundingClientRect();
   return { found: true, top: rect.top, height: rect.height };
+}
+"""
+
+
+_SCROLL_TO_HREF_JS = r"""
+(targetHref) => {
+  const anchors = Array.from(document.querySelectorAll('a[href]'));
+  const a = anchors.find((el) => {
+    const raw = el.getAttribute('href') || '';
+    return raw === targetHref || el.href === targetHref;
+  });
+  if (!a) return { found: false };
+  a.scrollIntoView({ block: 'center', behavior: 'instant' });
+  const rect = a.getBoundingClientRect();
+  return { found: true, top: rect.top, height: rect.height };
+}
+"""
+
+
+_GET_ANCHOR_BY_HREF_JS = r"""
+(targetHref) => {
+  const anchors = Array.from(document.querySelectorAll('a[href]'));
+  return anchors.find((el) => {
+    const raw = el.getAttribute('href') || '';
+    return raw === targetHref || el.href === targetHref;
+  }) || null;
 }
 """
 
@@ -587,6 +615,7 @@ class XhsDetailCrawler:
         note_id: str,
         *,
         url_for_logging: str = "",
+        target_href: str | None = None,
         wait_after_click_s: float = 1.6,
         modal_timeout_ms: int = 12_000,
     ) -> DetailResult:
@@ -607,7 +636,10 @@ class XhsDetailCrawler:
             # ---- 1. Find the anchor by scrolling the feed ----
             found = False
             for _ in range(self._MAX_SCROLL_TO_FIND):
-                probe = await page.evaluate(_SCROLL_TO_NOTE_JS, note_id)
+                if target_href:
+                    probe = await page.evaluate(_SCROLL_TO_HREF_JS, target_href)
+                else:
+                    probe = await page.evaluate(_SCROLL_TO_NOTE_JS, note_id)
                 if probe.get("found"):
                     found = True
                     break
@@ -637,9 +669,25 @@ class XhsDetailCrawler:
             # event with isTrusted=true. We also briefly hover first to mimic
             # a human reading the card before clicking.
             click_url_before = page.url
-            anchor = page.locator(
-                f'a[href*="/explore/{note_id}"], a[href*="/discovery/item/{note_id}"]'
-            ).first
+            anchor_element = None
+            if target_href:
+                handle = await page.evaluate_handle(_GET_ANCHOR_BY_HREF_JS, target_href)
+                anchor_element = handle.as_element()
+
+            if anchor_element is None:
+                # Prefer the card anchor that carries xsec_token. xhs also renders
+                # a bare /explore/<id> anchor in the card; clicking that often
+                # lands on a 404/300031 page instead of opening the SPA modal.
+                token_anchor = page.locator(f'a[href*="/{note_id}?xsec_token="]')
+                if await token_anchor.count() > 0:
+                  anchor = token_anchor.first
+                else:
+                  anchor = page.locator(
+                    f'a[href*="/explore/{note_id}"], '
+                    f'a[href*="/discovery/item/{note_id}"]'
+                  ).first
+            else:
+                anchor = anchor_element
             try:
                 await anchor.scroll_into_view_if_needed(timeout=4_000)
             except Exception:
@@ -658,7 +706,11 @@ class XhsDetailCrawler:
                     """
                     (noteId) => {
                       const a = document.querySelector(
-                        `a[href*="/explore/${noteId}"], a[href*="/discovery/item/${noteId}"]`
+                        `a[href*="/${noteId}?xsec_token="], ` +
+                        `a[href*="/explore/${noteId}"][href*="xsec_token="], ` +
+                        `a[href*="/discovery/item/${noteId}"][href*="xsec_token="], ` +
+                        `a[href*="/explore/${noteId}"], ` +
+                        `a[href*="/discovery/item/${noteId}"]`
                       );
                       if (a) a.click();
                     }
@@ -754,6 +806,9 @@ class XhsDetailCrawler:
         if self._collection_url and (
             "/explore/" in (page.url or "")
             or "/discovery/item/" in (page.url or "")
+          or "/404" in (page.url or "")
+          or "error_code=300031" in (page.url or "")
+          or "website-login/error" in (page.url or "")
         ):
             try:
                 await page.goto(self._collection_url, wait_until="domcontentloaded")

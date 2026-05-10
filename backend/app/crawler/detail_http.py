@@ -212,6 +212,15 @@ async def fetch_note_detail_http(
             error=f"http {resp.status_code}: {resp.text[:200]}",
         )
 
+    # Detect IP-level throttle: xhs 302s to /website-login/error?error_code=300013
+    # ("访问频繁，请稍后再试"). The final page is the login error shell.
+    final_url = str(resp.url)
+    if "website-login/error" in final_url or "error_code=300013" in final_url:
+        return DetailResult(
+            note_id=note_id, url=url, ok=False,
+            error="throttled by xhs (300013: 访问频繁) — back off and retry later",
+        )
+
     html = resp.text
 
     # Detect QR wall served when xsec_token expired or xhs didn't like us.

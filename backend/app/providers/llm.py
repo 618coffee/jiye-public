@@ -30,17 +30,38 @@ class LLMProvider(ABC):
         self,
         titles: list[str],
         *,
-        target_clusters: int = 12,
+        target_clusters: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Group a free-form list of note titles into ~target_clusters thematic
-        buckets. Used by the inbox-filtering UI so the user can decide which
-        category to spend processing budget on.
+        """Group a free-form list of note titles into thematic buckets.
+
+        ``target_clusters`` is an optional **hint** to the LLM; ``None``
+        (default) means the model picks whatever number of clusters fits
+        the data — could be 1, could be 40. Used by the inbox-filtering UI
+        so the user can decide which category to spend processing budget on.
 
         Returns: list of {id, name, description, sample_titles}
-          - id: short slug ('food-jp', 'cafe-sh', ...)
-          - name: human-friendly Chinese label (8-12 字)
+          - id: short slug ('food', 'cafe', 'hiking', ...)
+          - name: human-friendly Chinese label (6-12 字)
           - description: one-line explanation (≤30 字)
           - sample_titles: 2-4 representative titles drawn from the input
+        """
+
+    @abstractmethod
+    def classify_titles(
+        self,
+        titles: list[str],
+        clusters: list[dict[str, Any]],
+    ) -> list[str | None]:
+        """Assign each title to one of ``clusters`` (by id), or None if the
+        title clearly doesn't fit any bucket.
+
+        ``clusters`` items must have at least ``id`` and ``name``;
+        ``description`` and ``sample_titles`` are used when present to
+        improve the model's grounding.
+
+        Returns a list the same length as ``titles``. Each entry is either
+        a cluster id from the input list, or ``None`` for "no good fit"
+        (the caller routes those to a low-confidence bucket).
         """
 
 
@@ -163,8 +184,12 @@ class MockLLMProvider(LLMProvider):
             })
         return {"hot": hot, "cold": cold, "dish_radar": dish, "blind_spots": blind}
 
-    def cluster_titles(self, titles: list[str], *, target_clusters: int = 12) -> list[dict[str, Any]]:
-        """Heuristic mock: bucket by purpose/city hints, then 'Other'."""
+    def cluster_titles(self, titles: list[str], *, target_clusters: int | None = None) -> list[dict[str, Any]]:
+        """Heuristic mock: bucket by purpose/city hints, then 'Other'.
+
+        ``target_clusters`` is honoured only as a soft cap. ``None`` means
+        "no cap" (free-form), which mirrors the real provider.
+        """
         from collections import defaultdict
         # bucket key -> (label, list of titles)
         buckets: dict[str, list[str]] = defaultdict(list)
@@ -200,7 +225,35 @@ class MockLLMProvider(LLMProvider):
                 "description": f"包含 {len(items)} 条相关收藏",
                 "sample_titles": items[:3],
             })
-        return out[:target_clusters]
+        return out if target_clusters is None else out[:target_clusters]
+
+    def classify_titles(
+        self,
+        titles: list[str],
+        clusters: list[dict[str, Any]],
+    ) -> list[str | None]:
+        """Mock classifier: keyword scan against cluster name + samples."""
+        if not titles or not clusters:
+            return [None] * len(titles)
+        # Build keyword bag per cluster: name + sample tokens
+        bags: list[tuple[str, set[str]]] = []
+        for c in clusters:
+            cid = c.get("id") or ""
+            kws: set[str] = set()
+            for s in [c.get("name", "")] + list(c.get("sample_titles", []) or []):
+                for tok in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z]{3,}", s or ""):
+                    kws.add(tok.lower())
+            bags.append((cid, kws))
+        out: list[str | None] = []
+        for t in titles:
+            t_low = t.lower()
+            best, best_score = None, 0
+            for cid, kws in bags:
+                score = sum(1 for k in kws if k in t_low)
+                if score > best_score:
+                    best, best_score = cid, score
+            out.append(best if best_score >= 1 else None)
+        return out
 
 
 class QwenLLMProvider(LLMProvider):
@@ -239,8 +292,11 @@ class QwenLLMProvider(LLMProvider):
     def cluster_city(self, city: str, notes: list[dict[str, Any]]) -> dict[str, Any]:
         return MockLLMProvider().cluster_city(city, notes)
 
-    def cluster_titles(self, titles: list[str], *, target_clusters: int = 12) -> list[dict[str, Any]]:
+    def cluster_titles(self, titles: list[str], *, target_clusters: int | None = None) -> list[dict[str, Any]]:
         return MockLLMProvider().cluster_titles(titles, target_clusters=target_clusters)
+
+    def classify_titles(self, titles, clusters):
+        return MockLLMProvider().classify_titles(titles, clusters)
 
 
 _EXTRACT_PROMPT = (
@@ -411,31 +467,60 @@ class AzureOpenAILLMProvider(LLMProvider):
         except Exception:
             return MockLLMProvider().cluster_city(city, notes)
 
-    def cluster_titles(self, titles: list[str], *, target_clusters: int = 12) -> list[dict[str, Any]]:
+    def cluster_titles(self, titles: list[str], *, target_clusters: int | None = None) -> list[dict[str, Any]]:
         if not titles:
             return []
-        # Truncate each title to 60 chars and cap total count to be safe with
-        # context windows; the caller is expected to sample if it has more.
-        sample = [t[:60] for t in titles[:300]]
+        # Truncate each note item and cap total count to be safe with context
+        # windows; the caller is expected to sample if it has more. Items may
+        # be title-only or enriched text: title + tags + body excerpt.
+        sample = [t[:260] for t in titles[:300]]
         numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(sample))
+        # Two prompt modes:
+        #  - target_clusters=None (default in the UI): let the LLM pick the
+        #    natural number of clusters. Could be 1 (everything is travel),
+        #    could be 30+ (very diverse hobbyist).
+        #  - target_clusters=int: legacy hint mode, kept for tests / scripts.
+        if target_clusters is None:
+            count_directive = (
+                "**\u7c07\u6570**\uff1a\u7531\u4f60\u6839\u636e\u5185\u5bb9\u81ea\u7531\u51b3\u5b9a\u3002\u53ef\u80fd\u53ea\u67091\u4e2a\u7c07\uff08\u5982\u679c\u6536\u85cf\u9ad8\u5ea6\u540c\u8d28\uff09\uff0c\n"
+                "   \u4e5f\u53ef\u80fd\u667030+\u4e2a\u7c07\uff08\u5982\u679c\u6536\u85cf\u6781\u4e3a\u591a\u5143\uff09\u3002\u539f\u5219\u662f\u201c\u5408\u5e76\u540c\u8d28\u3001\u4e0d\u5f3a\u5212\u201d\uff1a\n"
+                "   \u540c\u4e00\u4e3b\u9898\u4e0b\u53ea\u7559\u4e00\u4e2a\u7c07\uff0c\u4f46\u4e0d\u8981\u4e3a\u4e86\u51d1\u6570\u91cf\u628a\u4e0d\u540c\u4e3b\u9898\u5f3a\u53e0\u5728\u4e00\u8d77\u3002"
+            )
+        else:
+            lo = max(target_clusters - 4, 2)
+            hi = target_clusters + 4
+            count_directive = (
+                f"**\u7c07\u6570**\uff1a\u63a7\u5236\u5728 {lo}-{hi} \u4e4b\u95f4\uff0c\u592a\u591a\u5c31\u5408\u5e76\uff1b\u5b81\u5c11\u52ff\u591a\u3002"
+            )
         prompt = (
-            f"以下是用户从小红书收藏的笔记标题（共 {len(sample)} 条）：\n"
+            f"以下是用户从小红书收藏的笔记条目（可能包含标题、标签、正文摘要；共 {len(sample)} 条）：\n"
             f"{numbered}\n\n"
-            f"请把它们按主题/地点/类型聚成 {target_clusters} 个中文簇，输出严格 JSON 数组：\n"
+            "请把它们按**主题/活动/兴趣**聚成若干个中文簇，综合标题、标签和正文摘要判断，不要只看地名；输出严格 JSON 数组：\n"
             "[\n"
             '  {\n'
-            '    "id": "短英文 slug，如 food-jp / cafe-sh / fitness / fashion-outfit",\n'
-            '    "name": "中文标签（6-12 字，例如「京都美食」「上海咖啡」「健身打卡」）",\n'
-            '    "description": "一句话说明这个簇收什么样的帖子（≤30 字）",\n'
-            '    "sample_titles": ["挑 8-12 条最有代表性的原标题（多一些样本能让后续 EM 更稳健）"]\n'
+            '    "id": "\u77ed\u82f1\u6587 slug\uff0c\u5982 food / cafe / hiking / city-walk / photo-gear / fashion-outfit / car-maintenance / ticketing",\n'
+            '    "name": "\u4e2d\u6587\u6807\u7b7e\uff086-12 \u5b57\uff0c\u4f8b\u5982\u300c\u5496\u5561\u63a2\u5e97\u300d\u300c\u5f92\u6b65\u767b\u5c71\u300d\u300c\u57ce\u5e02\u6f2b\u6b65\u300d\u300c\u7a7f\u642d\u53c2\u8003\u300d\u300c\u62cd\u7167\u673a\u4f4d\u300d\u300c\u6570\u7801\u8bc4\u6d4b\u300d\uff09",\n'
+            '    "description": "\u4e00\u53e5\u8bdd\u8bf4\u660e\u8fd9\u4e2a\u7c07\u6536\u4ec0\u4e48\u6837\u7684\u5e16\u5b50\uff08\u226430 \u5b57\uff09",\n'
+            '    "sample_titles": ["\u6311 8-12 \u6761\u6700\u6709\u4ee3\u8868\u6027\u7684\u539f\u6807\u9898\uff08\u591a\u4e00\u4e9b\u6837\u672c\u80fd\u8ba9\u540e\u7eed EM \u66f4\u7a33\u5065\uff09"]\n'
             '  },\n'
             "  ...\n"
             "]\n"
-            "注意：\n"
-            f"1) 簇数控制在 {max(target_clusters - 4, 6)}-{target_clusters + 4} 之间，太多就合并；\n"
-            "2) sample_titles 必须是上面列表里出现过的原文，每个簇 8-12 条；\n"
-            "3) 每条标题尽量只归到一个簇，但允许 ≤10% 标题不属于任何明显簇——把它们归到 id='other' / name='其他';\n"
-            "4) 不要返回 markdown，只返回 JSON 数组。"
+            "**\u5173\u952e\u89c4\u5219\uff08\u8fdd\u53cd\u4f1a\u5bfc\u81f4\u805a\u7c7b\u65e0\u6cd5\u4f7f\u7528\uff09\uff1a**\n"
+            "1) **覆盖率优先**：你产出的簇必须能覆盖**至少 70% 的输入条目**。\n"
+            "   \u5982\u679c\u67d0\u4e2a\u4e3b\u9898\uff08\u4f8b\u5982\u300c\u65c5\u884c/\u51fa\u884c\u300d\u300c\u7f8e\u98df\u300d\u300c\u7a7f\u642d\u300d\uff09\u4e0b\u7b14\u8bb0**\u5f88\u591a**\uff0c\n"
+            "   \u5c31**\u5fc5\u987b**\u4e3a\u5b83\u5efa\u4e00\u4e2a\u6216\u51e0\u4e2a\u5bbd\u6876\uff0c\u4e0d\u8981\u53ea\u6311\u51fa\u5c0f\u4f17\u7ec6\u5206\u4e3b\u9898\u800c\u628a\u5927\u5934\u7559\u7ed9 'other'\u3002\n"
+            "   \u53cd\u4f8b\uff1a\u53ea\u8f93\u51fa\u300c\u5c45\u5bb6\u70f9\u996a\u300d\u300c\u5496\u5561\u9986\u300d\u300c\u6444\u5f71\u540e\u671f\u300d\u4e09\u4e2a\u7a84\u6876\uff0c\u628a 800 \u6761\u65c5\u884c\u7b14\u8bb0\u5168\u6254\u8fdb 'other'\u2014\u2014\u8fd9\u662f**\u9519\u8bef**\u7684\u3002\n"
+            "   \u6b63\u786e\u505a\u6cd5\uff1a\u5148\u8bc6\u522b top 3 \u5927\u4e3b\u9898\uff0c\u4e3a\u5b83\u4eec\u5404\u5efa\u5bbd\u6876\uff0c\u7136\u540e\u518d\u8865\u51e0\u4e2a\u5c0f\u4f17\u7c07\u3002\n"
+            "2) **\u7981\u6b62**\u4ee5\u56fd\u5bb6/\u5730\u533a/\u5927\u6d32\u505a\u4e3b\u5206\u7c7b\u3002\u4e0d\u5141\u8bb8\u51fa\u73b0\u300c\u65e5\u672c\u65c5\u884c\u300d\u300c\u6b27\u6d32\u98ce\u5149\u300d\u300c\u56fd\u5185\u653b\u7565\u300d\u300c\u7f8e\u56fd\u751f\u6d3b\u300d\u300c\u4e1c\u5357\u4e9a\u300d\u8fd9\u7c7b\u7c07\u2014\u2014\n"
+            "   \u5730\u540d\u53ea\u80fd\u662f\u526f\u7ebf\u7d22\uff0c\u4e0d\u80fd\u6210\u4e3a\u7c07\u7684\u4e3b\u8f74\u3002\u53ef\u4ee5\u6309**\u505a\u4ec0\u4e48**\u5207\u65c5\u884c\uff1a\n"
+            "   \u6237\u5916\uff08\u5f92\u6b65/\u81ea\u9a7e/\u96ea\u5c71/\u9732\u8425\uff09\u3001\u6d77\u5c9b\u5ea6\u5047\u3001\u57ce\u5e02\u6f2b\u6b65/\u51fa\u7247\u3001\u535a\u7269\u9986/\u4eba\u6587\u3001\u9152\u5e97/\u6c11\u5bbf\u3001\u81ea\u9a7e/\u8def\u4e66 \u7b49\u3002\n"
+            "3) \u4f18\u5148\u6309**\u505a\u4ec0\u4e48 / \u770b\u4ec0\u4e48**\u5207\uff1a\u6237\u5916\u3001\u57ce\u5e02\u6f2b\u6b65\u3001\u5496\u5561\u63a2\u5e97\u3001\u9910\u5385\u7f8e\u98df\u3001\n"
+            "   \u62cd\u7167\u673a\u4f4d\u3001\u6444\u5f71\u5668\u6750\u3001\u7a7f\u642d\u3001\u5bb6\u5c45\u3001\u6570\u7801\u8bc4\u6d4b\u3001\u7968\u52a1/\u6f14\u51fa\u3001\u8f66/\u7ef4\u4fee\u3001\u5065\u8eab\u3001\u8bfb\u4e66\u3001\u5176\u4ed6\u6742\u9879 \u7b49\u3002\n"
+            f"4) {count_directive}\n"
+            "5) sample_titles \u5fc5\u987b\u662f\u4e0a\u9762\u5217\u8868\u91cc\u51fa\u73b0\u8fc7\u7684\u539f\u6587\uff0c\u6bcf\u4e2a\u7c07 8-12 \u6761\u3002\n"
+            "6) 'other'\uff08\u5176\u4ed6\u6742\u9879\uff09\u7684\u5360\u6bd4**\u4e0d\u5e94\u8d85\u8fc7 15%**\u3002\u5982\u679c\u4f60\u53d1\u73b0 >30% \u6807\u9898\u5f52\u5230 other\uff0c\n"
+            "   \u90a3\u8bf4\u660e\u4f60\u6f0f\u5efa\u4e86\u67d0\u4e2a\u4e3b\u6d41\u4e3b\u9898\u2014\u2014\u56de\u53bb\u8865\u4e00\u4e2a\u5bbd\u6876\u3002\n"
+            "7) \u4e0d\u8981\u8fd4\u56de markdown\uff0c\u53ea\u8fd4\u56de JSON \u6570\u7ec4\u3002"
         )
         try:
             content = self._chat(
@@ -496,6 +581,111 @@ class AzureOpenAILLMProvider(LLMProvider):
             print(f"[llm.cluster_titles] FAILED, falling back to mock: {e}")
             traceback.print_exc()
             return MockLLMProvider().cluster_titles(titles, target_clusters=target_clusters)
+
+    def classify_titles(
+        self,
+        titles: list[str],
+        clusters: list[dict[str, Any]],
+    ) -> list[str | None]:
+        """Batch-classify each note item into one of the proposed clusters.
+
+        Why this exists: e5 cosine on 8-15 char Chinese titles cannot reliably
+        distinguish 12 thematic buckets — short titles like "丹巴甲居藏寨"
+        share nothing lexical with the cluster centroids and end up assigned
+        more or less randomly. The LLM, given the title plus a labelled menu
+        of buckets, picks the right one almost every time.
+
+        Cost: ~50 titles per call, ~20 calls for 1000 titles. With
+        gpt-4o-mini that's a few cents per full re-cluster.
+        """
+        if not titles or not clusters:
+            return [None] * len(titles)
+
+        # Compact menu: one line per cluster.
+        menu_lines = []
+        for c in clusters:
+            cid = c.get("id") or ""
+            name = c.get("name") or ""
+            desc = (c.get("description") or "")[:50]
+            menu_lines.append(f"  - {cid}: {name}" + (f" — {desc}" if desc else ""))
+        menu = "\n".join(menu_lines)
+        valid_ids = {c.get("id") for c in clusters if c.get("id")}
+
+        BATCH = 50
+        out: list[str | None] = [None] * len(titles)
+        total_none = 0
+        examples_none: list[str] = []
+
+        for start in range(0, len(titles), BATCH):
+            batch = titles[start : start + BATCH]
+            numbered = "\n".join(f"{i+1}. {t[:360]}" for i, t in enumerate(batch))
+            prompt = (
+                "下面是用户从小红书收藏的笔记条目（可能包含标题、标签、正文摘要）。请把每条分到下列分类之一。\n\n"
+                "**分类清单：**\n" + menu + "\n\n"
+                "**笔记条目（编号从 1 开始）：**\n" + numbered + "\n\n"
+                "**任务：**对每个编号，输出它最匹配的分类 id。\n"
+                "- 只要标题、标签或正文摘要里出现明显的主题/活动/物品（旅行、餐厅、咖啡、穿搭、家居、相机、徒步、酒店…），就分到对应分类，不要轻易判 'none'。\n"
+                "- 如果条目里只有人名/地名/标点/表情，没有任何主题信号，才输出 'none'。\n"
+                "- 不要按地理位置分类（不要因为提到日本/上海就强行归到旅行；要看做的事情）。\n"
+                "- 'none' 比例**不应超过 10%**。\n\n"
+                "**输出**：严格 JSON，键 'assignments' 的值是数组，长度等于输入条数，"
+                f"每个元素是该编号对应的 id 字符串（必须是上面分类清单里的某个 id，或字面字符串 'none'）。\n"
+                "示例：{\"assignments\": [\"food-restaurant\", \"travel-scenic\", \"none\", ...]}"
+            )
+            try:
+                content = self._chat(
+                    [
+                        {"role": "system", "content": "你是分类助手。只输出严格 JSON 对象，不要 markdown 不要解释。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    json_mode=True,
+                    max_tokens=2000,
+                    temperature=0.0,
+                )
+                data = _parse_json_lenient(content)
+                assignments: list[Any] | None = None
+                if isinstance(data, dict):
+                    for k in ("assignments", "result", "results", "labels", "data", "array", "items"):
+                        if isinstance(data.get(k), list):
+                            assignments = data[k]
+                            break
+                    # Also handle the common shape:
+                    # {"1": "food", "2": "cafe", ...} (numeric-keyed dict)
+                    if assignments is None and data:
+                        keys = list(data.keys())
+                        if all(k.isdigit() or k.startswith("title") for k in keys):
+                            try:
+                                ordered = sorted(data.items(), key=lambda kv: int(re.sub(r"\D", "", kv[0]) or "0"))
+                                assignments = [v for _, v in ordered]
+                            except Exception:
+                                pass
+                elif isinstance(data, list):
+                    assignments = data
+                if assignments is None:
+                    print(f"[classify_titles] batch {start}: parse failed, content={content[:300]!r}")
+                    continue
+                # Map back, validating each id
+                for i, raw in enumerate(assignments[: len(batch)]):
+                    if not isinstance(raw, str):
+                        if len(examples_none) < 8:
+                            examples_none.append(f"[non-str] {batch[i]}")
+                        total_none += 1
+                        continue
+                    cid = raw.strip()
+                    if cid in valid_ids:
+                        out[start + i] = cid
+                    else:
+                        total_none += 1
+                        if len(examples_none) < 8:
+                            examples_none.append(f"[{cid!r}] {batch[i]}")
+                    # else leave as None (low_conf)
+            except Exception as e:
+                print(f"[classify_titles] batch {start} FAILED: {e}; leaving as None")
+                continue
+        print(f"[classify_titles] {len(titles)} titles, {total_none} returned 'none'/unknown ({100*total_none/max(1,len(titles)):.1f}%)")
+        for ex in examples_none:
+            print(f"  none-example: {ex[:120]}")
+        return out
 
 
 def _parse_json_lenient(text: str) -> dict[str, Any] | None:
