@@ -220,20 +220,30 @@ curl -X POST localhost:8000/api/inbox/cluster \
 
 每批最多 50 条（`max_per_request`），前端按 10 条切片串行跑，避免超时 + 给 progress。已 `promoted` 的笔记自动剔除（防呆）。
 
-### 4.3 升级管道（HTTP-first / SPA-fallback）
+### 4.3 升级管道（HTTP-only 默认 / SPA 显式兜底）
 
 `backend/app/services/inbox_promote.py`：
 
-- **Phase 1（HTTP 优先）**：遍历选中的 `pending`，有 `xsec_token` 就调 `fetch_note_detail_http(note_id, xsec_token, xsec_source)`：
+- **Phase 1（HTTP 默认路径）**：遍历选中的 `pending`，有 `xsec_token` 就调 `fetch_note_detail_http(note_id, xsec_token, xsec_source)`：
   - cookie-less GET `https://www.xiaohongshu.com/explore/<id>?xsec_token=...&xsec_source=pc_user`
   - 正则提取 `window.__INITIAL_STATE__ = {...}`，先把裸 `undefined` 替换成 `null`，再 `json.loads`
   - 走 `noteData.noteDetailMap[<id>].note` → title/body/images/tags
   - `time` (ms) → ISO publish 时间戳
-  - 检测 QR 墙关键词（"请打开小红书 App 扫码查看" 等）→ 失败回落
+  - 检测 QR 墙关键词（"请打开小红书 App 扫码查看" 等）→ 标记失败并提示重新 scan 刷 token
   - 节流 0.6-1.4s
-- **Phase 2（SPA 兜底）**：HTTP 失败的笔记走旧的 `XhsDetailCrawler`（Playwright 在调试 Chrome 里 click `.cover` 弹模态框，从 DOM 抓内容）。
+- **Phase 2（SPA 兜底，默认关闭）**：只有显式传 `allow_spa_fallback=true`（CLI: `--allow-spa-fallback`）时，HTTP 失败的笔记才会走旧的 `XhsDetailCrawler`（Playwright 在调试 Chrome 里 click `.cover` 弹模态框，从 DOM 抓内容）。
+  - 这条路径容易触发 xhs 的二维码扫码墙；平时优先重新 scan 刷新 `xsec_token`，不要默认点开详情。
 - 拿到 `DetailResult` → `ingest_note()` → LLM 摘要 + POI 抽取 + 向量嵌入 → 写 `notes` / `note_chunks` / `note_poi`
 - `note_inbox.status` 设为 `promoted`，`promoted_at` 写入
+
+**合成示例（非真实收藏或实测记录）**：下面只演示 HTTP-only 路径成功时的结果形状：
+
+| note_id | 结果 | 正文 | 图片 | 标签 |
+|---|---|---:|---:|---:|
+| `<example-note-a>` | promoted | 100 字 | 1 | 2 |
+| `<example-note-b>` | promoted | 200 字 | 2 | 3 |
+
+MediaCrawler 对照：`media_platform/xhs/client.py:get_note_by_id_from_html()` 也是同一条路线，带 `xsec_token` 请求 `/explore/<id>` 并解析 `window.__INITIAL_STATE__`。它的 core 里有带 cookie 的 HTML fallback；对个人收藏库场景，这个 fallback 更容易撞二维码墙，所以本仓库默认禁用。
 
 ### 4.4 探针逻辑（probe）
 
@@ -256,8 +266,9 @@ curl -X POST localhost:8000/api/inbox/cluster \
 | 抓回来全是别人发的笔记 | 你停在了 `/explore`，用 `--url` 直达 profile；或者在调试 Chrome 里手动跳到你的 profile 页让自动发现走途径 2/3 |
 | 抓回来全是自己发的笔记 | 收藏 tab 没切换，加 `--debug` 看 `tab click attempt` 是否 `clicked=true` |
 | 数量比预期少很多 | 加 `--idle 8 --max-scrolls 800 --pause 2.0` 重跑 |
-| Promote 时弹二维码扫码墙 | 不该再发生（HTTP path 是无 cookie 的）。如果出现，说明落到 SPA fallback 了 — 检查 token 是否丢失（重新 scan 刷 token） |
-| HTTP path 报 "note_card missing from __INITIAL_STATE__" | xsec_token 失效或 note 已被作者删除。重 scan，或落到 SPA fallback |
+| Promote 时弹二维码扫码墙 | 默认不该发生（HTTP path 是无 cookie 的）。如果出现，说明显式打开了 SPA fallback；先关掉 fallback，重新 scan 刷 token 后再 promote |
+| HTTP path 报 "missing xsec_token" | 旧 inbox 行没有详情 token。重新 scan 收藏夹刷新 `note_inbox.raw_meta.xsec_token` |
+| HTTP path 报 "note_card missing from __INITIAL_STATE__" | xsec_token 失效、note 已删除、App-only，或 xhs 临时改版。先重 scan；仍失败就先保留在 failed，避免用 SPA fallback 硬点详情 |
 | 想从头来过 | `rm data/index.db` 重启后端会自动建（**会丢光所有数据**） |
 
 ---

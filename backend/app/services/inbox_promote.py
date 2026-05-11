@@ -62,6 +62,7 @@ def promote_notes(
     per_note_pause_s: float = 2.5,
     per_note_jitter_s: float = 1.2,
     debug_dom: bool = False,
+    allow_spa_fallback: bool = False,
 ) -> PromoteRunResult:
     """Synchronous wrapper around the async promote pipeline."""
     return asyncio.run(
@@ -73,6 +74,7 @@ def promote_notes(
             per_note_pause_s=per_note_pause_s,
             per_note_jitter_s=per_note_jitter_s,
             debug_dom=debug_dom,
+            allow_spa_fallback=allow_spa_fallback,
         )
     )
 
@@ -86,6 +88,7 @@ async def _promote_async(
     per_note_pause_s: float,
     per_note_jitter_s: float,
     debug_dom: bool,
+    allow_spa_fallback: bool,
 ) -> PromoteRunResult:
     started = time.monotonic()
     out = PromoteRunResult()
@@ -143,7 +146,21 @@ async def _promote_async(
         token = meta.get("xsec_token")
         source = meta.get("xsec_source") or "pc_user"
         if not token:
-            needs_spa.append((nid, url, inbox_row))
+            if allow_spa_fallback:
+                needs_spa.append((nid, url, inbox_row))
+            else:
+                _record(
+                    store,
+                    out,
+                    nid,
+                    inbox_row,
+                    DetailResult(
+                        note_id=nid,
+                        url=url,
+                        ok=False,
+                        error="missing xsec_token; re-scan inbox to refresh detail token",
+                    ),
+                )
             continue
         try:
             detail = await fetch_note_detail_http(
@@ -161,8 +178,16 @@ async def _promote_async(
                 await asyncio.sleep(0.6 + _rnd.random() * 0.8)
         else:
             # HTTP path failed (token expired, deleted note, layout drift...)
-            # Queue for SPA fallback.
-            needs_spa.append((nid, url, inbox_row))
+            # By default we stop here instead of clicking into the logged-in
+            # SPA, because that path is what tends to trigger xhs's QR wall.
+            if allow_spa_fallback:
+                needs_spa.append((nid, url, inbox_row))
+            else:
+                err = detail.error or "HTTP detail fetch failed"
+                if "xsec_token" in err or "QR wall" in err or "__INITIAL_STATE__" in err:
+                    err = f"{err}; re-scan inbox to refresh xsec_token"
+                detail.error = err
+                _record(store, out, nid, inbox_row, detail)
 
     # ---- Phase 2: SPA-click fallback for the leftovers. This requires Chrome
     # over CDP and is what previously triggered QR walls — only used when HTTP

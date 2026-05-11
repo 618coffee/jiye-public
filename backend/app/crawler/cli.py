@@ -124,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="Cap per invocation (default 20, hard max 50)")
     pp.add_argument("--debug", action="store_true",
                     help="Print detail-page DOM probe debug info")
+    pp.add_argument("--allow-spa-fallback", action="store_true",
+                    help="If HTTP detail fetch fails, click the logged-in xhs page as a fallback")
 
     args = parser.parse_args(argv)
     if args.cmd == "promote":
@@ -141,6 +143,7 @@ def cmd_promote(args: argparse.Namespace) -> int:
         max_per_request=args.max,
         cdp_endpoint=args.cdp,
         debug_dom=args.debug,
+        allow_spa_fallback=args.allow_spa_fallback,
     )
     print(f"[promote] done in {res.duration_s:.1f}s — "
           f"promoted={res.promoted} failed={res.failed} skipped={res.skipped}")

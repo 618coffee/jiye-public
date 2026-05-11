@@ -234,11 +234,11 @@ export const api = {
     postJson<InboxClusterRunResult>('/api/inbox/cluster', body ?? {}),
   inboxDiscard: (note_ids: string[]) =>
     postJson<{ discarded: number }>('/api/inbox/discard', { note_ids }),
-  inboxPromote: (note_ids: string[], max_per_request?: number) =>
+  inboxPromote: (note_ids: string[], max_per_request?: number, allow_spa_fallback = false) =>
     postJson<InboxPromoteResult>('/api/inbox/promote',
       max_per_request !== undefined
-        ? { note_ids, max_per_request }
-        : { note_ids }),
+        ? { note_ids, max_per_request, allow_spa_fallback }
+        : { note_ids, allow_spa_fallback }),
   inboxScan: (body?: { url?: string; idle?: number; pause?: number; max_scrolls?: number; full?: boolean }) =>
     postJson<{
       scanned: number;

@@ -199,8 +199,8 @@ export default function InboxPage() {
       if (!confirm(`已自动跳过 ${skipped} 条已入库笔记。继续升级剩余 ${ids.length} 条？`)) return;
     } else if (!confirm(
       `确认把这 ${ids.length} 条加工进知识库？\n\n` +
-      `每条会自动打开详情页 → LLM 摘要 → 抽取 POI → 写入主库。` +
-      `预计每条 5-10 秒，期间请保持小红书 Chrome 标签页打开且已登录。`
+      `默认通过无 cookie 的网页详情数据抓正文和标签，不会自动点开小红书笔记。` +
+      `预计每条 5-10 秒，失败时请先重新扫描收藏夹刷新 token。`
     )) return;
 
     setPromoting(true);

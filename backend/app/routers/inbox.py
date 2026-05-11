@@ -178,6 +178,8 @@ def promote(
     Body:
       - note_ids:       list[str]    required, non-empty
       - max_per_request:int          optional, default 20, hard cap 50
+      - allow_spa_fallback: bool     optional, default false; clicking the
+        logged-in xhs page is riskier and can trigger the QR wall
 
     Response:
       - results:    list[{note_id, status, error?, title?}]
@@ -198,7 +200,13 @@ def promote(
             400, f"max_per_request must be in [1, {HARD_MAX_PER_REQUEST}]"
         )
 
-    res = promote_notes(store, note_ids, max_per_request=max_per)
+    allow_spa_fallback = bool(payload.get("allow_spa_fallback") or False)
+    res = promote_notes(
+        store,
+        note_ids,
+        max_per_request=max_per,
+        allow_spa_fallback=allow_spa_fallback,
+    )
     return {
         "results": [
             {
