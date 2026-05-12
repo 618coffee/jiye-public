@@ -20,12 +20,13 @@ const PURPOSE_META: Record<string, { label: string; icon: string }> = {
 export function NoteCard({ note }: { note: Note }) {
   const firstPoi = note.pois[0];
   const fresh = firstPoi ? freshnessLabel(firstPoi.poi.freshness_status) : null;
+  const cover = note.image_thumbnails?.[0] || note.cover || note.images[0];
   return (
     <Link href={`/note/${note.id}`} className="block group">
       <Card className="card-lift overflow-hidden h-full flex flex-col">
         <div className="relative aspect-[4/3] overflow-hidden">
           <SmartImage
-            src={note.cover}
+            src={cover}
             alt={note.title}
             fallbackSeed={note.id}
             className="w-full h-full transition-transform duration-700 ease-out group-hover:scale-[1.04]"

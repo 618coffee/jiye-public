@@ -223,7 +223,14 @@ class SqliteStore(KnowledgeStore):
                   trip_purpose, image_index_level, ai_summary, source)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
-                  title=excluded.title, body=excluded.body, ai_summary=excluded.ai_summary,
+                  url=COALESCE(excluded.url, notes.url),
+                  title=excluded.title, body=excluded.body,
+                  author=COALESCE(excluded.author, notes.author),
+                  cover=COALESCE(excluded.cover, notes.cover),
+                  published_at=COALESCE(excluded.published_at, notes.published_at),
+                  saved_at=COALESCE(excluded.saved_at, notes.saved_at),
+                  image_paths=excluded.image_paths,
+                  ai_summary=excluded.ai_summary,
                   image_thumbnails=excluded.image_thumbnails, image_ocr_texts=excluded.image_ocr_texts,
                   primary_city=excluded.primary_city, primary_country=excluded.primary_country,
                   trip_purpose=excluded.trip_purpose, image_index_level=excluded.image_index_level,
@@ -466,6 +473,28 @@ class SqliteStore(KnowledgeStore):
             if not row:
                 return None
             return self._note_row_to_dict(c, row)
+
+    def get_note_media_bulk(self, note_ids: list[str]) -> dict[str, dict[str, Any]]:
+        if not note_ids:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        with self._conn() as c:
+            placeholders = ",".join("?" * len(note_ids))
+            rows = c.execute(
+                f"""SELECT id, cover, image_paths, image_thumbnails
+                    FROM notes
+                    WHERE id IN ({placeholders})""",
+                note_ids,
+            ).fetchall()
+            for row in rows:
+                thumbs = json.loads(row["image_thumbnails"] or "[]")
+                images = json.loads(row["image_paths"] or "[]")
+                out[row["id"]] = {
+                    "cover": row["cover"],
+                    "images": images,
+                    "image_thumbnails": thumbs,
+                }
+        return out
 
     def search(self, query: str, *, limit: int = 20, city: str | None = None) -> list[dict[str, Any]]:
         # Hybrid: FTS5 + (optional) vector cosine merge.

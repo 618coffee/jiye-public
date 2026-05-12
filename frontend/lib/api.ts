@@ -135,6 +135,9 @@ export interface InboxItem {
   url: string;
   title: string | null;
   cover_url: string | null;
+  note_cover?: string | null;
+  note_thumbnail?: string | null;
+  note_image_thumbnails?: (string | null)[];
   author: string | null;
   saved_at: string | null;
   discovered_at: string;

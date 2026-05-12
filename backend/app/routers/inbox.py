@@ -41,6 +41,20 @@ def _filter_detail_tags(items: list[dict[str, Any]], tags: list[str]) -> list[di
     return [it for it in items if selected.intersection(_detail_tags(it))]
 
 
+def _hydrate_note_media(items: list[dict[str, Any]], store: SqliteStore) -> None:
+    note_ids = [it["note_id"] for it in items if it.get("status") == "promoted"]
+    media_by_id = store.get_note_media_bulk(note_ids)
+    for it in items:
+        media = media_by_id.get(it["note_id"])
+        if not media:
+            continue
+        thumbnails = [u for u in media.get("image_thumbnails", []) if u]
+        images = [u for u in media.get("images", []) if u]
+        it["note_image_thumbnails"] = thumbnails
+        it["note_thumbnail"] = thumbnails[0] if thumbnails else None
+        it["note_cover"] = media.get("cover") or (images[0] if images else None)
+
+
 @router.get("")
 def list_inbox(
     status: str | None = Query(None),
@@ -89,6 +103,7 @@ def list_inbox(
         items = _filter_detail_tags(items, tag_filter)
         items = items[offset: offset + limit]
     if items:
+        _hydrate_note_media(items, store)
         tags_by_id = store.get_note_tags_bulk([it["note_id"] for it in items])
         for it in items:
             it["tags"] = tags_by_id.get(it["note_id"], [])

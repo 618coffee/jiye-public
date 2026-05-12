@@ -256,13 +256,20 @@ def ingest_note(store: KnowledgeStore, raw: dict[str, Any]) -> str:
             c["embedding"] = v
 
     # ---------- Image OCR + thumbnail pipeline ----------
+    # Some lightweight import paths only have a feed cover, not the full image
+    # carousel. Cache that cover too; xhs CDN URLs often expire or 403 later.
+    raw_images = list(raw.get("images") or [])
+    cover = raw.get("cover")
+    if cover and cover not in raw_images:
+        raw_images.insert(0, cover)
+
     ocr_results: list[ocr_service.OCRResult] = []
     image_thumbnails: list[str | None] = []
     image_ocr_texts: list[str] = []
-    if raw.get("images"):
+    if raw_images:
         ocr_results = ocr_service.process_images(
             raw["id"],
-            raw.get("images") or [],
+            raw_images,
             enabled=settings.ocr_enabled,
         )
         image_thumbnails = [r.thumb_url for r in ocr_results]
@@ -286,6 +293,7 @@ def ingest_note(store: KnowledgeStore, raw: dict[str, Any]) -> str:
 
     note = {
         **raw,
+        "images": raw_images,
         "primary_city": extracted.get("primary_city"),
         "primary_country": extracted.get("primary_country", "CN"),
         "city_confidence": extracted.get("city_confidence", 0.9),

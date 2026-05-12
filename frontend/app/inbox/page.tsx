@@ -985,6 +985,7 @@ function InboxCard({
   const showTagChips = tags.length > 1;
   const clusterName = (cid: string) =>
     clusters.find((c) => c.id === cid)?.name ?? cid;
+  const cover = item.note_thumbnail || item.note_cover || item.cover_url;
   return (
     <Card
       className={cn(
@@ -999,7 +1000,7 @@ function InboxCard({
     >
       <div className="relative aspect-[4/5] overflow-hidden bg-ink-100">
         <SmartImage
-          src={item.cover_url}
+          src={cover}
           alt={item.title ?? ''}
           fallbackSeed={item.note_id}
           className="w-full h-full transition-transform duration-700 ease-out group-hover:scale-[1.04]"
