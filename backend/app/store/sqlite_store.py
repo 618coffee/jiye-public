@@ -268,8 +268,16 @@ class SqliteStore(KnowledgeStore):
             if row:
                 pid = row["id"]
                 c.execute(
-                    """UPDATE pois SET aliases=?, country=?, poi_type=?, lat=?, lng=?,
-                       amap_id=?, google_place_id=?, address=? WHERE id=?""",
+                    """UPDATE pois SET
+                         aliases=COALESCE(?, aliases),
+                         country=COALESCE(?, country),
+                         poi_type=COALESCE(?, poi_type),
+                         lat=COALESCE(?, lat),
+                         lng=COALESCE(?, lng),
+                         amap_id=COALESCE(?, amap_id),
+                         google_place_id=COALESCE(?, google_place_id),
+                         address=COALESCE(?, address)
+                       WHERE id=?""",
                     (json.dumps(poi.get("aliases", []), ensure_ascii=False),
                      poi.get("country", "CN"), poi.get("poi_type"),
                      poi.get("lat"), poi.get("lng"),
@@ -286,6 +294,23 @@ class SqliteStore(KnowledgeStore):
                  poi.get("amap_id"), poi.get("google_place_id"), poi.get("address")),
             )
             return cur.lastrowid
+
+    def update_poi_location(self, poi_id: int, poi: dict[str, Any]) -> None:
+        allowed = {
+            "lat", "lng", "address", "amap_id", "google_place_id",
+            "canonical_name", "aliases", "country", "poi_type",
+        }
+        updates = {k: v for k, v in poi.items() if k in allowed and v is not None}
+        if not updates:
+            return
+        if "aliases" in updates:
+            updates["aliases"] = json.dumps(updates["aliases"], ensure_ascii=False)
+        assignments = ", ".join(f"{k} = ?" for k in updates)
+        with self._conn() as c:
+            c.execute(
+                f"UPDATE pois SET {assignments} WHERE id = ?",
+                [*updates.values(), poi_id],
+            )
 
     def link_note_poi(self, note_id: str, poi_id: int, link: dict[str, Any]) -> None:
         with self._conn() as c:
@@ -560,7 +585,8 @@ class SqliteStore(KnowledgeStore):
                 """SELECT p.* FROM pois p
                    LEFT JOIN poi_freshness f ON f.poi_id = p.id
                    WHERE p.city = ?
-                     AND (f.last_checked_at IS NULL
+                     AND (p.lat IS NULL OR p.lng IS NULL
+                          OR f.last_checked_at IS NULL
                           OR julianday('now') - julianday(f.last_checked_at) > ?)""",
                 (city, fresh_window_days),
             ).fetchall()
@@ -960,4 +986,3 @@ class SqliteStore(KnowledgeStore):
         with self._conn() as c:
             rows = c.execute(sql, params).fetchall()
             return [self._inbox_row_to_dict(r) for r in rows]
-

@@ -13,6 +13,9 @@ def refresh_city(store: SqliteStore, city: str, *, fresh_window_days: int = 14) 
     refreshed = 0
     for poi in stale:
         result = validator.validate(poi)
+        poi_update = result.get("poi_update") or {}
+        if poi_update:
+            store.update_poi_location(poi["id"], poi_update)
         store.upsert_freshness(poi["id"], result["status"], result["score"], result["signals"])
         refreshed += 1
     # Re-pull POIs (with new freshness data)

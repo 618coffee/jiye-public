@@ -45,6 +45,8 @@ cd frontend && npm run dev
 ```env
 QWEN_API_KEY=sk-xxx        # 阿里 Dashscope
 AMAP_API_KEY=xxx           # 高德 POI
+AMAP_JS_API_KEY=xxx        # 高德 JS 地图（可选；本地可复用 AMAP_API_KEY）
+AMAP_SECURITY_JS_CODE=xxx  # 高德 JS 安全密钥（可选）
 GOOGLE_PLACES_API_KEY=xxx  # 海外 POI（可选）
 ```
 
@@ -53,7 +55,7 @@ GOOGLE_PLACES_API_KEY=xxx  # 海外 POI（可选）
 - 🗺️ **目的地工作台** — 输入"6月去京都"，自动聚合相关收藏，按必去/美食/咖啡/购物/拍照分组
 - 🔍 **自然语言搜索** — "找我收藏过的、人均 200 以内、有露台的咖啡店"
 - 📂 **我的收藏（inbox）** — 一键扫描小红书收藏夹，多标签自动聚类，人工筛选后升级进主库（详见 [docs/crawler.md](./docs/crawler.md) / [docs/clustering.md](./docs/clustering.md)）
-- ✅ **按需鲜活度验证** — 选定城市才触发该城市 POI 的高德/Google 验证
+- ✅ **按需鲜活度验证** — 选定城市才触发该城市 POI 的高德/Google 验证，地图展示统一走高德
 - 🏷️ **AI 自动城市分类** — Ingest 时自动打 city/country/trip_purpose 标签
 - 📂 **L1/L2 分级索引** — 文本默认全开，图片可选深度索引
 

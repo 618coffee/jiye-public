@@ -23,7 +23,12 @@ def get_settings() -> dict:
             "llm": llm_provider,
             "embedding": emb_provider,
             "amap": "configured" if settings.amap_api_key else "mock",
+            "amap_js": "configured" if (settings.amap_js_api_key or settings.amap_api_key) else "mock",
             "google_places": "configured" if settings.google_places_api_key else "mock",
+        },
+        "maps": {
+            "amap_js_api_key": settings.amap_js_api_key or settings.amap_api_key,
+            "amap_security_js_code": settings.amap_security_js_code,
         },
         "data_dir": str(settings.data_path),
         "use_mock": settings.use_mock,

@@ -28,6 +28,10 @@ class Settings(BaseSettings):
 
     # POI validators
     amap_api_key: str = ""
+    # Browser-visible AMap JS API key. Falls back to AMAP_API_KEY for local dev,
+    # but production should use a web-js key with referer restrictions.
+    amap_js_api_key: str = ""
+    amap_security_js_code: str = ""
     google_places_api_key: str = ""
 
     # 'auto' = mock when key missing; 'true' = always mock; 'false' = never mock

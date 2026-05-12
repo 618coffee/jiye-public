@@ -76,6 +76,12 @@ PLACE_TERMS = [
 ]
 
 
+PLACE_POI_STOP_TERMS = {
+    "土耳其", "英国", "荷兰", "欧洲", "日本", "美国", "巴厘岛",
+    "Turkey", "Netherlands", "Hawaii",
+}
+
+
 _PLACE_RE = re.compile(
     "|".join(re.escape(x) for x in sorted(PLACE_TERMS, key=len, reverse=True)),
     re.I,
@@ -219,6 +225,29 @@ def ingest_note(store: KnowledgeStore, raw: dict[str, Any]) -> str:
             "price_per_person": p.get("price_per_person"),
             "highlight": p.get("highlight"),
         })
+
+    if not persist_pois and place_terms:
+        for place in place_terms[:5]:
+            if place in PLACE_POI_STOP_TERMS or place == extracted.get("primary_city"):
+                continue
+            persist_pois.append({
+                "canonical_name": place,
+                "city": extracted.get("primary_city"),
+                "country": extracted.get("primary_country", "CN"),
+                "poi_type": "place",
+                "must_try": None,
+                "price_per_person": None,
+                "highlight": "从标题/正文识别出的地点",
+            })
+            chunks.append({
+                "chunk_type": "poi_card",
+                "text": " · ".join(filter(None, [
+                    place,
+                    "place",
+                    extracted.get("primary_city"),
+                    "从标题/正文识别出的地点",
+                ])),
+            })
 
     # Embed
     if chunks:

@@ -90,6 +90,37 @@ def workbench(city: str, store: SqliteStore = Depends(get_store)) -> dict:
     }
 
 
+@router.get("/{city}/pois.geojson")
+def poi_geojson(city: str, store: SqliteStore = Depends(get_store)) -> dict:
+    wb = store.workbench(city)
+    features = []
+    for poi in wb["pois"]:
+        lat = poi.get("lat")
+        lng = poi.get("lng")
+        if lat is None or lng is None:
+            continue
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lng, lat]},
+            "properties": {
+                "id": poi["id"],
+                "name": poi["canonical_name"],
+                "city": poi.get("city"),
+                "country": poi.get("country"),
+                "type": poi.get("poi_type"),
+                "address": poi.get("address"),
+                "freshness_status": poi.get("freshness_status"),
+                "freshness_score": poi.get("freshness_score"),
+                "last_checked_at": poi.get("last_checked_at"),
+            },
+        })
+    return {
+        "type": "FeatureCollection",
+        "name": f"{city} POIs",
+        "features": features,
+    }
+
+
 @router.post("/{city}/refresh")
 def refresh(city: str, store: SqliteStore = Depends(get_store)) -> dict:
     return do_refresh(store, city)

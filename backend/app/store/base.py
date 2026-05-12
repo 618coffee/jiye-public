@@ -16,6 +16,9 @@ class KnowledgeStore(ABC):
     def upsert_poi(self, poi: dict[str, Any]) -> int: ...
 
     @abstractmethod
+    def update_poi_location(self, poi_id: int, poi: dict[str, Any]) -> None: ...
+
+    @abstractmethod
     def link_note_poi(self, note_id: str, poi_id: int, link: dict[str, Any]) -> None: ...
 
     @abstractmethod

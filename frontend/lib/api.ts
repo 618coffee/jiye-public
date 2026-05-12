@@ -101,6 +101,28 @@ export interface FreshnessRefreshResponse {
   pois: POI[];
 }
 
+export interface POIGeoJSONFeature {
+  type: 'Feature';
+  geometry: { type: 'Point'; coordinates: [number, number] };
+  properties: {
+    id: number;
+    name: string;
+    city?: string | null;
+    country?: string | null;
+    type?: string | null;
+    address?: string | null;
+    freshness_status?: string | null;
+    freshness_score?: number | null;
+    last_checked_at?: string | null;
+  };
+}
+
+export interface POIGeoJSON {
+  type: 'FeatureCollection';
+  name: string;
+  features: POIGeoJSONFeature[];
+}
+
 export interface InboxClusterTag {
   cluster_id: string;
   score: number;
@@ -206,6 +228,7 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 export const api = {
   cities: () => get<{ cities: CitySummary[] }>('/api/cities'),
   workbench: (city: string) => get<WorkbenchData>(`/api/cities/${encodeURIComponent(city)}/workbench`),
+  poiGeoJSON: (city: string) => get<POIGeoJSON>(`/api/cities/${encodeURIComponent(city)}/pois.geojson`),
   refresh: (city: string) => post<FreshnessRefreshResponse>(`/api/cities/${encodeURIComponent(city)}/refresh`),
   note: (id: string) => get<Note>(`/api/notes/${encodeURIComponent(id)}`),
   search: (q: string, city?: string) => {
@@ -213,7 +236,12 @@ export const api = {
     if (city) params.set('city', city);
     return get<SearchResponse>(`/api/search?${params.toString()}`);
   },
-  settings: () => get<{ providers: Record<string, string>; data_dir: string; use_mock: string }>('/api/settings'),
+  settings: () => get<{
+    providers: Record<string, string>;
+    maps?: { amap_js_api_key?: string; amap_security_js_code?: string };
+    data_dir: string;
+    use_mock: string;
+  }>('/api/settings'),
   inboxStats: () => get<InboxStats>('/api/inbox/stats'),
   inboxList: (params: { status?: string; cluster_id?: string; detail_tags?: string[]; title_query?: string; limit?: number; offset?: number }) => {
     const qs = new URLSearchParams();

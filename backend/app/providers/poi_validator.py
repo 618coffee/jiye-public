@@ -1,7 +1,8 @@
-"""POI freshness validator — Amap / Google Places, mock fallback."""
+"""POI freshness + coordinate validator — Amap / Google Places, mock fallback."""
 from __future__ import annotations
 
 import hashlib
+import math
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -11,7 +12,110 @@ from ..config import settings
 class POIValidator(ABC):
     @abstractmethod
     def validate(self, poi: dict[str, Any]) -> dict[str, Any]:
-        """Return {status: alive|suspect|closed|unknown, score: 0-100, signals: {...}}"""
+        """Return freshness plus optional ``poi_update`` with lat/lng/address IDs."""
+
+
+_CITY_CENTERS: dict[str, tuple[float, float]] = {
+    "北京": (39.9042, 116.4074),
+    "上海": (31.2304, 121.4737),
+    "广州": (23.1291, 113.2644),
+    "深圳": (22.5431, 114.0579),
+    "杭州": (30.2741, 120.1551),
+    "成都": (30.5728, 104.0668),
+    "重庆": (29.5630, 106.5516),
+    "厦门": (24.4798, 118.0894),
+    "南京": (32.0603, 118.7969),
+    "苏州": (31.2989, 120.5853),
+    "东京": (35.6762, 139.6503),
+    "京都": (35.0116, 135.7681),
+    "大阪": (34.6937, 135.5023),
+    "洛杉矶": (34.0522, -118.2437),
+    "纽约": (40.7128, -74.0060),
+    "旧金山": (37.7749, -122.4194),
+    "拉斯维加斯": (36.1699, -115.1398),
+    "西雅图": (47.6062, -122.3321),
+    "巴黎": (48.8566, 2.3522),
+    "伦敦": (51.5072, -0.1276),
+    "曼谷": (13.7563, 100.5018),
+    "首尔": (37.5665, 126.9780),
+    "新加坡": (1.3521, 103.8198),
+    "阿姆斯特丹": (52.3676, 4.9041),
+    "卡帕多奇亚": (38.6431, 34.8289),
+    "冲绳": (26.2124, 127.6809),
+}
+
+
+def _hash_jitter(name: str, *, radius: float = 0.035) -> tuple[float, float]:
+    h = int(hashlib.sha1(name.encode("utf-8")).hexdigest(), 16)
+    lat_jitter = (((h >> 8) % 2001) / 1000.0 - 1.0) * radius
+    lng_jitter = (((h >> 20) % 2001) / 1000.0 - 1.0) * radius
+    return lat_jitter, lng_jitter
+
+
+def _mock_location_for(poi: dict[str, Any]) -> dict[str, Any] | None:
+    city = (poi.get("city") or "").strip()
+    center = _CITY_CENTERS.get(city)
+    if center is None:
+        return None
+    lat_jitter, lng_jitter = _hash_jitter(
+        f"{poi.get('canonical_name', '')}:{city}",
+    )
+    lat, lng = center
+    return {
+        "lat": round(lat + lat_jitter, 6),
+        "lng": round(lng + lng_jitter, 6),
+        "address": f"{city} · mock geocode",
+    }
+
+
+def _parse_amap_location(value: str | None) -> tuple[float, float] | None:
+    if not value or "," not in value:
+        return None
+    try:
+        lng_s, lat_s = value.split(",", 1)
+        return float(lat_s), float(lng_s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _out_of_china(lat: float, lng: float) -> bool:
+    return not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271)
+
+
+def _transform_lat(x: float, y: float) -> float:
+    ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y
+    ret += 0.2 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(y * math.pi) + 40.0 * math.sin(y / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (160.0 * math.sin(y / 12.0 * math.pi) + 320 * math.sin(y * math.pi / 30.0)) * 2.0 / 3.0
+    return ret
+
+
+def _transform_lng(x: float, y: float) -> float:
+    ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y
+    ret += 0.1 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(x * math.pi) + 40.0 * math.sin(x / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (150.0 * math.sin(x / 12.0 * math.pi) + 300.0 * math.sin(x / 30.0 * math.pi)) * 2.0 / 3.0
+    return ret
+
+
+def _gcj02_to_wgs84(lat: float, lng: float) -> tuple[float, float]:
+    if _out_of_china(lat, lng):
+        return lat, lng
+    a = 6378245.0
+    ee = 0.00669342162296594323
+    dlat = _transform_lat(lng - 105.0, lat - 35.0)
+    dlng = _transform_lng(lng - 105.0, lat - 35.0)
+    radlat = lat / 180.0 * math.pi
+    magic = math.sin(radlat)
+    magic = 1 - ee * magic * magic
+    sqrt_magic = math.sqrt(magic)
+    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrt_magic) * math.pi)
+    dlng = (dlng * 180.0) / (a / sqrt_magic * math.cos(radlat) * math.pi)
+    mg_lat = lat + dlat
+    mg_lng = lng + dlng
+    return lat * 2 - mg_lat, lng * 2 - mg_lng
 
 
 class MockPOIValidator(POIValidator):
@@ -32,7 +136,12 @@ class MockPOIValidator(POIValidator):
             "neg_keyword_ratio": round(((h >> 12) % 30) / 100.0, 2),
             "source": "mock",
         }
-        return {"status": status, "score": score, "signals": signals}
+        out: dict[str, Any] = {"status": status, "score": score, "signals": signals}
+        location = _mock_location_for(poi)
+        if location:
+            out["poi_update"] = location
+            signals["geocoded"] = True
+        return out
 
 
 class AmapPOIValidator(POIValidator):
@@ -69,6 +178,16 @@ class AmapPOIValidator(POIValidator):
                     "signals": {"source": "amap", "hits": 0, "reason": "no_match"},
                 }
             top = pois[0]
+            matched_location = _parse_amap_location(top.get("location"))
+            poi_update: dict[str, Any] = {}
+            if matched_location:
+                lat, lng = _gcj02_to_wgs84(*matched_location)
+                poi_update["lat"] = round(lat, 7)
+                poi_update["lng"] = round(lng, 7)
+            if top.get("address"):
+                poi_update["address"] = top.get("address")
+            if top.get("id"):
+                poi_update["amap_id"] = top.get("id")
             biz_status = (top.get("business_status") or "").strip()  # "1"=营业 "0"=暂停 ""=未知
             rating_raw = top.get("biz_ext", {}).get("rating") or top.get("rating") or ""
             try:
@@ -90,21 +209,27 @@ class AmapPOIValidator(POIValidator):
                 status = "suspect"
             else:
                 status = "closed"
-            return {
+            out: dict[str, Any] = {
                 "status": status,
                 "score": score,
                 "signals": {
                     "source": "amap",
                     "hits": len(pois),
+                    "matched_name": top.get("name"),
                     "amap_rating": rating,
                     "business_status": biz_status,
                     "address": top.get("address"),
                     "tel": top.get("tel"),
                 },
             }
+            if poi_update:
+                out["poi_update"] = poi_update
+            return out
         except Exception as e:
             fallback = MockPOIValidator().validate(poi)
+            fallback.pop("poi_update", None)
             fallback["signals"]["source"] = f"mock_fallback:{type(e).__name__}"
+            fallback["signals"]["geocoded"] = False
             return fallback
 
 
@@ -125,7 +250,7 @@ class GooglePlacesValidator(POIValidator):
                 headers={
                     "Content-Type": "application/json",
                     "X-Goog-Api-Key": self.api_key,
-                    "X-Goog-FieldMask": "places.displayName,places.businessStatus,places.rating,places.userRatingCount,places.formattedAddress",
+                    "X-Goog-FieldMask": "places.id,places.displayName,places.businessStatus,places.rating,places.userRatingCount,places.formattedAddress,places.location",
                 },
                 json={"textQuery": query, "maxResultCount": 5},
                 timeout=15,
@@ -139,6 +264,15 @@ class GooglePlacesValidator(POIValidator):
                     "signals": {"source": "google_places", "hits": 0, "reason": "no_match"},
                 }
             top = places[0]
+            loc = top.get("location") or {}
+            poi_update: dict[str, Any] = {}
+            if loc.get("latitude") is not None and loc.get("longitude") is not None:
+                poi_update["lat"] = float(loc["latitude"])
+                poi_update["lng"] = float(loc["longitude"])
+            if top.get("formattedAddress"):
+                poi_update["address"] = top.get("formattedAddress")
+            if top.get("id"):
+                poi_update["google_place_id"] = top.get("id")
             biz = top.get("businessStatus", "OPERATIONAL")
             rating = top.get("rating")
             user_count = top.get("userRatingCount", 0)
@@ -156,21 +290,28 @@ class GooglePlacesValidator(POIValidator):
                 status = "suspect"
             else:
                 status = "closed"
-            return {
+            display_name = top.get("displayName") or {}
+            out: dict[str, Any] = {
                 "status": status,
                 "score": score,
                 "signals": {
                     "source": "google_places",
                     "hits": len(places),
+                    "matched_name": display_name.get("text"),
                     "rating": rating,
                     "user_rating_count": user_count,
                     "business_status": biz,
                     "address": top.get("formattedAddress"),
                 },
             }
+            if poi_update:
+                out["poi_update"] = poi_update
+            return out
         except Exception as e:
             fallback = MockPOIValidator().validate(poi)
+            fallback.pop("poi_update", None)
             fallback["signals"]["source"] = f"mock_fallback:{type(e).__name__}"
+            fallback["signals"]["geocoded"] = False
             return fallback
 
 

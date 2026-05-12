@@ -12,6 +12,7 @@ import { CategoryTabs } from './CategoryTabs';
 import { NoteCard } from './NoteCard';
 import { POIRail } from './POIRail';
 import { ClusterRail } from './ClusterRail';
+import { POIMap } from './POIMap';
 
 interface Props {
   data: WorkbenchData;
@@ -93,6 +94,9 @@ export function Workbench({ data }: Props) {
 
       {/* POI rail (with freshness badges) */}
       {pois.length > 0 && <POIRail pois={pois} />}
+
+      {/* Map of validated POIs */}
+      {pois.length > 0 && <POIMap city={data.city} pois={pois} />}
 
       {/* AI clusters */}
       {data.clusters && <ClusterRail clusters={data.clusters} notes={data.notes} />}
